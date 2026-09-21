@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "warmfold",
+  "version": "0.1.0",
+  "description": "Compacts or hands off an idle session before the prompt cache expires, so the first request after a break is cheap.",
+  "author": {
+    "name": "Piotr Lewandowski"
+  },
+  "license": "MIT",
+  "commands": "./commands",
+  "userConfig": {
+    "idle_minutes": {
+      "type": "number",
+      "title": "Idle minutes",
+      "description": "The watcher acts after this many idle minutes.",
+      "default": 30,
+      "min": 1,
+      "max": 55
+    },
+    "min_context_tokens": {
+      "type": "number",
+      "title": "Minimum context tokens",
+      "description": "The watcher ignores contexts below this size.",
+      "default": 100000
+    },
+    "mode": {
+      "type": "string",
+      "title": "Mode",
+      "description": "The action before cache expiry. Auto picks compact when it can type in your terminal.",
+      "default": "auto",
+      "options": ["auto", "compact", "handoff", "keepalive", "warn"]
+    },
+    "guard": {
+      "type": "boolean",
+      "title": "Cold return guard",
+      "description": "Block the first prompt once when the cache is cold and the context is large.",
+      "default": true
+    },
+    "ttl_5m_policy": {
+      "type": "string",
+      "title": "5 minute TTL policy",
+      "description": "What to do when the session cache lasts only 5 minutes.",
+      "default": "warn",
+      "options": ["warn", "compact_at_4m", "off"]
+    },
+    "keepalive_hours": {
+      "type": "number",
+      "title": "Keepalive hours",
+      "description": "In keepalive mode, wake the session for at most this many hours.",
+      "default": 0,
+      "min": 0,
+      "max": 12
+    }
+  }
+}

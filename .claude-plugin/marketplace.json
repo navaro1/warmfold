@@ -1,0 +1,14 @@
+{
+  "name": "warmfold-local",
+  "owner": {
+    "name": "Piotr Lewandowski"
+  },
+  "description": "Local marketplace for the warmfold plugin.",
+  "plugins": [
+    {
+      "name": "warmfold",
+      "source": "./",
+      "description": "Compacts or hands off an idle session before the prompt cache expires."
+    }
+  ]
+}

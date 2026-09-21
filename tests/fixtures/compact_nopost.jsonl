@@ -1,0 +1,3 @@
+{"parentUuid":null,"isSidechain":false,"type":"user","timestamp":"2026-09-21T11:30:00.000Z","uuid":"u1","sessionId":"sess-compact2","message":{"role":"user","content":"Another long analysis task."}}
+{"parentUuid":"u1","isSidechain":false,"type":"assistant","timestamp":"2026-09-21T11:30:10.000Z","uuid":"a1","sessionId":"sess-compact2","message":{"model":"claude-sonnet-5","usage":{"input_tokens":1000,"cache_creation_input_tokens":80000,"cache_read_input_tokens":319000,"output_tokens":900,"cache_creation":{"ephemeral_1h_input_tokens":80000,"ephemeral_5m_input_tokens":0}}}}
+{"type":"system","subtype":"compact_boundary","content":"Conversation compacted","timestamp":"2026-09-21T11:35:00.000Z","compactMetadata":{"trigger":"manual","preTokens":93724}}
