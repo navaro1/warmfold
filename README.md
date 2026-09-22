@@ -1,6 +1,6 @@
 # warmfold
 
-warmfold is a Claude Code plugin that compacts or hands off an idle session before the prompt cache expires.
+warmfold is a Claude Code plugin that compacts an idle session before the prompt cache expires.
 
 | One event on a 500,000-token Fable 5.1 session | Cost |
 |---|---|
@@ -67,12 +67,12 @@ Open a session. Run `/warmfold:status`. Defaults work with no configuration. The
 | Terminal in GNU screen | Compact in place (untested) |
 | Apple Terminal.app | Compact in the exact Claude tab (macOS) |
 | Ghostty | Compact in the exact terminal identified by a temporary title nonce (macOS) |
-| Plain terminal without a supported terminal API | Handoff |
-| Claude Desktop app | Handoff |
-| VS Code extension | Handoff |
+| Plain terminal without a supported terminal API | Defer with status diagnostics |
+| Claude Desktop app | Defer with status diagnostics |
+| VS Code extension | Defer with status diagnostics |
 | T3 Code | Compact in place through its native local orchestration API (after `t3-setup`) |
 
-Return flow: type anything. The guard message appears. Run `/clear`. The handoff loads. Continue.
+When no verified native channel is available, warmfold records a deferred action and leaves the session untouched.
 
 ### Verified hosts
 
@@ -82,10 +82,8 @@ Live tests on 2026-09-21 with Claude Code 2.1.278 on Linux. Each test used a rea
 |---|---|---|
 | tmux 3.2a | compact in place (keystrokes) | pass, one compaction, no loop |
 | zellij 0.45.1 | compact in place (keystrokes, `--pane-id`) | pass |
-| Plain terminal (raw pty, no multiplexer) | handoff (wake) | pass |
 | T3 Code desktop 0.0.43 nightly (Agent SDK) | native `/compact` dispatch | proof reduced the context from 30940 to 6082 tokens; hooks loaded from the user-scope plugin |
 | Cold return guard | block once, then pass | pass |
-| `/clear` handoff loader | injects the saved handoff | pass |
 | `/warmfold:status` | local report rendered by the normal Claude response path | pass |
 
 ## Configure
@@ -96,10 +94,10 @@ The plugin shows these options in `/config`:
 |---|---|---|
 | `idle_minutes` | 30 | Idle minutes before the watcher acts. |
 | `min_context_tokens` | 100000 | Contexts below this size are ignored. |
-| `mode` | `auto` | `auto`, `compact`, `handoff`, `keepalive`, or `warn`. |
+| `mode` | `auto` | `auto`, `compact`, `keepalive`, or `warn`. Legacy `handoff` config maps to `auto`. |
 | `guard` | true | Block the first prompt on a cold return. |
 | `ttl_5m_policy` | `warn` | `warn`, `compact_at_4m`, or `off`. Applies to a 5-minute cache. |
-| `keepalive_hours` | 0 | Maximum keepalive hours. 0 in keepalive mode means an immediate handoff. |
+| `keepalive_hours` | 0 | Maximum keepalive hours. When the budget ends, warmfold attempts native compaction. |
 
 Advanced keys. Set them in `~/.claude/plugins/data/warmfold-warmfold-local/config.json` or as `WARMFOLD_<KEY>` environment variables. `/warmfold:status` prints `Data dir:` with the active directory:
 
@@ -108,11 +106,9 @@ Advanced keys. Set them in `~/.claude/plugins/data/warmfold-warmfold-local/confi
 | `safety_margin_minutes` | 5 | Act at least this long before cache expiry. |
 | `guard_min_usd` | 1.0 | Guard only above this rebuild cost. |
 | `guard_ack_seconds` | 120 | A second submit inside this window passes. |
-| `handoff_autoload` | `clear` | `clear`, `clear+startup`, or `off`. |
-| `handoff_max_age_hours` | 24 | Ignore older handoffs. |
 | `poll_seconds` | 15 | Watcher poll interval. |
 | `pane_markers` | `❯ ` | Prompt markers the watcher looks for. |
-| `data_dir` | `$CLAUDE_PLUGIN_DATA`, else `~/.claude/warmfold` | State, handoffs, log. |
+| `data_dir` | `$CLAUDE_PLUGIN_DATA`, else `~/.claude/warmfold` | State, ledger, and log. Legacy handoff data is preserved but unused. |
 | `force_ttl_seconds` | 0 | Test only. Overrides the TTL. |
 | `force_channel` | empty | Test only. `none` disables terminal typing. |
 
@@ -165,7 +161,7 @@ pasteboard type only when the native change count still matches the plugin's
 capture path. The plugin
 never focuses a window or sends a global keyboard event. If the target,
 screen capture, or prompt fingerprint cannot be verified exactly, it falls
-back to the handoff flow.
+to a deferred action with diagnostics in the log and status report.
 
 ## Mac self-check
 
@@ -173,7 +169,7 @@ back to the handoff flow.
    shown below. Set `idle_minutes` to `1` and `min_context_tokens` to `1000`.
 2. Send a small prompt, wait for the turn to stop, and stay idle for about 2
    minutes. Expect exactly one `compact_boundary`, `phase=compact_sent`, and
-   no handoff reminder. Repeat once in Apple Terminal and once in Ghostty.
+   no deferred action. Repeat once in Apple Terminal and once in Ghostty.
 3. Before the Ghostty run, copy rich text. Confirm the clipboard contents and
    types are unchanged after the screen capture.
 
@@ -211,7 +207,7 @@ claude plugin uninstall warmfold@warmfold-local --keep-data
 claude plugin marketplace remove warmfold-local --scope user
 ```
 
-`--keep-data` keeps the config, state, log, and handoffs.
+`--keep-data` keeps the config, state, log, ledger, and any legacy handoff files.
 
 ## Development
 

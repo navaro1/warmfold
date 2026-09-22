@@ -21,8 +21,6 @@ DEFAULTS = {
     "guard": True,
     "guard_min_usd": 1.0,
     "guard_ack_seconds": 120.0,
-    "handoff_autoload": "clear",
-    "handoff_max_age_hours": 24.0,
     "poll_seconds": 15.0,
     "pane_markers": "❯ ",
     "data_dir": "",
@@ -47,7 +45,6 @@ _BOOL_KEYS = frozenset(k for k, v in DEFAULTS.items() if isinstance(v, bool))
 _ENUM_KEYS = {
     "mode": frozenset(("auto", "compact", "handoff", "keepalive", "warn")),
     "ttl_5m_policy": frozenset(("warn", "off", "compact_at_4m")),
-    "handoff_autoload": frozenset(("off", "clear", "startup", "clear+startup")),
 }
 _TRUE_WORDS = frozenset(("1", "true", "yes"))
 _FALSE_WORDS = frozenset(("0", "false", "no"))
@@ -158,6 +155,10 @@ def load():
             if coerced is not _INVALID:
                 cfg[key] = coerced
 
+    # ``handoff`` was supported by 0.1.2. Keep old config files readable, but
+    # map the retired mode to automatic native compaction.
+    if cfg.get("mode") == "handoff":
+        cfg["mode"] = "auto"
     if cfg["data_dir"]:
         cfg["data_dir"] = os.path.expanduser(str(cfg["data_dir"]))
     return cfg

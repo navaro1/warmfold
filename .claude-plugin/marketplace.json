@@ -8,7 +8,7 @@
     {
       "name": "warmfold",
       "source": "./",
-      "description": "Compacts or hands off an idle session before the prompt cache expires."
+      "description": "Compacts an idle session before the prompt cache expires."
     }
   ]
 }

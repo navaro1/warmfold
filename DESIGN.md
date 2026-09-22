@@ -1,6 +1,6 @@
 # warmfold — implementer brief
 
-Plugin for Claude Code. It compacts (or hands off) an idle session before the
+Plugin for Claude Code. It compacts an idle session before the
 prompt cache expires, so the first request after a long break is cheap.
 
 This file is the shared contract for the work packages. Keep it in sync with the
@@ -15,9 +15,9 @@ code. Prose in this repo follows ASD-STE100 Simplified Technical English.
 | `/compact` sends the full history in one request. Warm: it reads the prefix from cache. Cold: it pays full price. | Never compact a cold session. Compact only while warm. |
 | Hooks cannot run slash commands. Scheduled tasks (cron, `/loop`) deliver built-in commands as plain text. | Only a keystroke in a terminal, or the user, can run `/compact`. |
 | An `async: true, asyncRewake: true` command hook that exits 2 wakes Claude even while the session is idle. Its stderr reaches Claude as a system reminder. | This is the universal idle trigger. It works in the CLI, Desktop app, VS Code, and SDK hosts such as T3 Code. |
-| `Stop` input has `last_assistant_message`, `background_tasks`, `session_crons`. `Stop` does not fire on user interrupt. `StopFailure` fires on API errors. | The watcher saves the handoff text from `last_assistant_message`. |
+| `Stop` input has `last_assistant_message`, `background_tasks`, `session_crons`. `Stop` does not fire on user interrupt. `StopFailure` fires on API errors. | The watcher uses the event to evaluate native compaction. |
 | `UserPromptSubmit` can block a prompt (`decision: "block"`, `reason`, `suppressOriginalPrompt`) or add `hookSpecificOutput.additionalContext` for the normal response path. | The return guard still applies to every real turn. `/warmfold:status` and `/warmfold:savings` compute read-only reports locally after normal prompt bookkeeping, then ask Claude to render them verbatim through a normal response. |
-| `SessionStart` matchers: `startup`, `resume`, `clear`, `compact`. Its `additionalContext` reaches Claude. | The handoff loader injects the saved handoff after `/clear`. |
+| `SessionStart` matchers: `startup`, `resume`, `clear`, `compact`. Its `additionalContext` reaches Claude. | SessionStart only resets watcher state. |
 | `Notification/idle_prompt` fires ~60 s after Claude stops, only if the user typed nothing. | Hint that the input box is empty. |
 | Hook processes inherit the environment of the `claude` process (`TMUX_PANE`, `ZELLIJ_SESSION_NAME`, `KITTY_LISTEN_ON`, `WEZTERM_PANE`, `STY`). Hooks run without a controlling tty. | Channel detection uses env vars. Injection uses the multiplexer CLI, never `/dev/tty`. |
 | Exec-form hooks (`command` + `args`) spawn no shell. `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA`, `CLAUDE_PROJECT_DIR` are exported. Plugin `userConfig` values arrive as `CLAUDE_PLUGIN_OPTION_<KEY>`. | Use exec form. Parent PID of the hook process is the `claude` process. |
@@ -60,17 +60,15 @@ Precedence, first match wins:
 | `idle_minutes` | number | 30 | Idle time after a turn end before the action. |
 | `min_context_tokens` | number | 100000 | Below this, do nothing. |
 | `safety_margin_minutes` | number | 5 | Act at least this long before cache expiry. |
-| `mode` | string | `auto` | `auto`, `compact`, `handoff`, `keepalive`, `warn`. `auto` = `compact` when a verified keystroke channel exists, else `handoff`. |
-| `keepalive_hours` | number | 0 | In `keepalive` mode: max hours of keep-alive wakes, then handoff. |
+| `mode` | string | `auto` | `auto`, `compact`, `keepalive`, `warn`. Legacy `handoff` maps to `auto`. |
+| `keepalive_hours` | number | 0 | In `keepalive` mode: max hours of keep-alive wakes, then native compaction. |
 | `ttl_5m_policy` | string | `warn` | `warn`, `compact_at_4m`, `off`. Applies when the session TTL is 5 min. |
 | `guard` | boolean | true | Block the first prompt once when the cache is cold and the context is large. |
 | `guard_min_usd` | number | 1.0 | Guard only when the estimated cold cost is at least this. |
 | `guard_ack_seconds` | number | 120 | After a block, the next submit inside this window passes. |
-| `handoff_autoload` | string | `clear` | `clear`: inject the handoff after `/clear`. `clear+startup`: also on a new session in the same directory. `off`. |
-| `handoff_max_age_hours` | number | 24 | Older handoffs are ignored. |
 | `poll_seconds` | number | 15 | Watcher poll interval. |
 | `pane_markers` | string | `❯ ` | Comma-separated substrings. The captured screen must contain one, on a line framed by rule lines, before typing. |
-| `data_dir` | string | `$CLAUDE_PLUGIN_DATA` or `~/.claude/warmfold` | State, handoffs, log. |
+| `data_dir` | string | `$CLAUDE_PLUGIN_DATA` or `~/.claude/warmfold` | State, ledger, log; legacy handoff data is preserved but unused. |
 | `force_ttl_seconds` | number | 0 | Test only. Overrides the TTL read from the transcript. |
 | `force_channel` | string | `` | Test only. `none` disables keystroke channels. |
 
@@ -82,7 +80,7 @@ Precedence, first match wins:
 
 ```
 armed_token      float  epoch of the Stop that owns the current watcher
-phase            str    idle | handoff_pending | handoff_done | keepalive_pending | compact_sent | compact_pending | compact_deferred | cold | done
+phase            str    idle | keepalive_pending | compact_sent | compact_pending | compact_deferred | cold | done
 activity_at      float  last UserPromptSubmit
 idle_confirmed_at float last Notification idle_prompt
 guard_ack_until  float
@@ -93,7 +91,7 @@ channel          str    detected channel name or "none"
 cwd, transcript_path, model, context_tokens, ttl_seconds, expires_at  (last known, for /status)
 ```
 
-Handoffs: `<data_dir>/handoffs/<sha1(cwd)[:12]>/<YYYYmmdd-HHMMSS>-<session_id>.md` plus `latest.json` `{path, session_id, cwd, saved_at, consumed_at}`.
+Legacy handoff files, when present from 0.1.2, are preserved and ignored.
 
 Log: `<data_dir>/log/warmfold.log`, one line per event, truncated to 1 MB when it grows past 2 MB.
 
@@ -115,7 +113,7 @@ Function `read_transcript(path) -> TranscriptInfo`:
 All read JSON from stdin. All exit 0 with optional JSON on stdout unless stated. Never raise; log and exit 0 on internal errors (exit 0 must never block Claude).
 
 - `watch` (Stop, async + asyncRewake, timeout 7200):
-  1. Parse input. If `state.phase == handoff_pending` and `last_assistant_message` is non-empty: save it as the handoff, set `phase = handoff_done`, log, exit 0. Do not arm.
+  1. Parse input and resume only keep-alive state; legacy handoff phases are normalized to idle and never written.
   2. If `phase == keepalive_pending`: set `phase = idle`, `wake_count += 1`, continue to arm.
   3. Arm: `armed_token = now`, `phase = idle`, record channel name. Write state.
   4. Loop every `poll_seconds`:
@@ -127,29 +125,20 @@ All read JSON from stdin. All exit 0 with optional JSON on stdout unless stated.
      - `due = idle >= idle_minutes*60 or (expires_at - now) <= 60`.
      - If `ttl == 300`: apply `ttl_5m_policy` (`warn` and `off` → exit 0; `compact_at_4m` → `due = idle >= 240`).
      - If not due: continue.
-     - Resolve mode. `auto` → `compact` if a verified native terminal channel or an exact idle T3 target exists, else `handoff`.
-     - `compact`: inject through the verified channel. On success `phase = compact_sent`, `last_action_at`, exit 0. A rejected T3 request falls back to `handoff`; an accepted or uncertain T3 request records `compact_pending` and never sends a duplicate handoff. A recognized native terminal with a draft, dialog, or changed prompt records `compact_deferred` and skips the handoff fallback.
-     - `handoff`: `phase = handoff_pending`, write state, print the HANDOFF_REMINDER to stderr, exit 2.
-     - `keepalive`: if `wake_count * 55 min < keepalive_hours*3600`: `phase = keepalive_pending`, print KEEPALIVE_REMINDER to stderr, exit 2. Else `handoff`.
+     - Resolve mode. `auto` → `compact`; legacy `handoff` also maps to `compact`.
+     - `compact`: inject through the verified channel. On success `phase = compact_sent`, `last_action_at`, exit 0. An accepted or uncertain T3 request records `compact_pending`; a rejected or unavailable transport records `compact_deferred` and never sends a fallback prompt.
+     - `keepalive`: if `wake_count * 55 min < keepalive_hours*3600`: `phase = keepalive_pending`, print KEEPALIVE_REMINDER to stderr, exit 2. Else attempt native compaction.
      - `warn`: exit 0.
 - `prompt` (UserPromptSubmit, sync, timeout 10):
   1. If `prompt.strip()` exactly equals `/warmfold:status` or `/warmfold:savings`, run the normal activity/reset, configured guard, and pending-action settlement path. After a passing submit, build the read-only report and output `{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":<report plus verbatim rendering instruction>}}`, exit 0. Do not block or suppress the command. Claude renders the report through a normal response, which uses the usual API request and is recorded in the transcript.
-  2. `activity_at = now`. If `phase` in `(handoff_done, keepalive_pending, compact_sent, cold, done)`: `phase = idle`, `wake_count = 0`.
-  3. Guard: read transcript. `cold = now > last_request_start + ttl`. If `guard` and cold and `context_tokens >= min_context_tokens` and `cold_cost_usd >= guard_min_usd` and `now > guard_ack_until`: set `guard_ack_until = now + guard_ack_seconds`, output block JSON with the GUARD_MESSAGE (idle duration, context tokens, model, estimated cost, handoff hint if a fresh handoff exists, "resend to continue at full cost"). `suppressOriginalPrompt: false`.
-- `session-start` (SessionStart, matchers `startup|resume|clear|compact`): reset watcher state for the new session id. On `clear` (and `startup` when configured): if `latest.json` for this cwd is fresh and unconsumed, output `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":<handoff with a header>},"systemMessage":"warmfold: loaded handoff from <time>"}` and mark consumed. On `startup` with `handoff_autoload = clear`: inject one line only: "A warmfold handoff from <time> exists at <path>. Read it only if the user continues that work."
+  2. `activity_at = now`. If `phase` in `(keepalive_pending, compact_sent, cold, done)`: `phase = idle`, `wake_count = 0`.
+  3. Guard: read transcript. `cold = now > last_request_start + ttl`. If `guard` and cold and `context_tokens >= min_context_tokens` and `cold_cost_usd >= guard_min_usd` and `now > guard_ack_until`: set `guard_ack_until = now + guard_ack_seconds`, output block JSON with the GUARD_MESSAGE (idle duration, context tokens, model, estimated cost, "resend to continue at full cost"). `suppressOriginalPrompt: false`.
+- `session-start` (SessionStart, matchers `startup|resume|clear|compact`): reset watcher state for the new session id. It never reads or injects legacy files.
 - `session-end` (SessionEnd, must finish in < 1 s): set `phase = done`. Nothing else.
 - `notification` (Notification, matcher `idle_prompt`): `idle_confirmed_at = now`.
 - `pre-compact`: log trigger. `post-compact`: `last_compact_at = now`, `phase = idle`.
 - `stop-failure` (StopFailure): `phase = idle`, do not arm.
-- `status` (also used by `prompt`): print the report to stdout for manual use: session, model, context tokens, TTL, warm/cold, expires in, idle, channel, mode, next action, estimated cold cost, estimated warm compaction cost, handoff path.
-
-HANDOFF_REMINDER (stderr, exit 2):
-
-```
-warmfold: the user has been idle for {idle_min} minutes. The prompt cache expires in {left_min} minutes. Context is {tokens} tokens.
-Write a handoff summary for a fresh session. Use these headings: Goal, Current state, Decisions made, Open tasks, Key files and paths, Next step, Things to avoid.
-Rules: plain text under 1500 words, no tool calls, no questions, no preamble. Start with the first heading. Stop after the last section.
-```
+- `status` (also used by `prompt`): print the report to stdout for manual use: session, model, context tokens, TTL, warm/cold, expires in, idle, channel, mode, next action, estimated cold cost, and estimated warm compaction cost.
 
 KEEPALIVE_REMINDER: `warmfold keep-alive. Reply with exactly: ok`
 
@@ -166,7 +155,7 @@ KEEPALIVE_REMINDER: `warmfold keep-alive. Reply with exactly: ok`
 | screen | `STY` | `screen -S $STY -X hardcopy <tmpfile>` | `screen -S $STY -X stuff <bytes>` |
 | Apple Terminal.app | `TERM_PROGRAM=Apple_Terminal`, parent tty | AppleScript `contents` from the tab whose `tty` matches the Claude parent | AppleScript `do script` in that exact tab |
 | Ghostty | `TERM_PROGRAM=ghostty`, parent tty, macOS AppleScript | temporary OSC-2 title nonce written to the parent tty, matched to exactly one native terminal id; screen via `write_screen_file:copy` | AppleScript `input text` plus `send key enter` to that exact id |
-| T3 Code | exact hook `session_id` plus `cwd`, native local T3 state and loopback API | read-only SQLite target resolution, then scoped native bearer dispatch | one `thread.turn.start` with `/compact`; accepted and uncertain outcomes never fall back to a handoff |
+| T3 Code | exact hook `session_id` plus `cwd`, native local T3 state and loopback API | read-only SQLite target resolution, then scoped native bearer dispatch | one `thread.turn.start` with `/compact`; accepted and uncertain outcomes never fall back |
 
 `force_channel = none` disables all. Verification before typing, on every attempt:
 
@@ -185,8 +174,8 @@ the Claude parent tty, requires exactly one matching terminal id, asks that id
 to write its screen to a fresh temporary file through `write_screen_file:copy`,
 and restores every advertised pasteboard type only while the captured path
 and native change count still match. An
-ambiguous, unavailable, or changed target is treated as no channel and uses
-handoff mode.
+ambiguous, unavailable, or changed target is treated as no channel and safely
+defers native compaction. A legacy handoff mode maps to native compaction.
 
 `inject_compact()` never sends anything if the fingerprint fails.
 
@@ -198,7 +187,7 @@ handoff mode.
 
 ## 9. Plugin manifest and hooks
 
-`plugin.json`: `name: "warmfold"`, `version: "0.1.2"`, `description`, `author`, `hooks: "./hooks/hooks.json"`, `commands: "./commands"`, `userConfig` as in section 3.
+`plugin.json`: `name: "warmfold"`, `version: "0.1.3"`, native compaction description, `author`, `hooks: "./hooks/hooks.json"`, `commands: "./commands"`, `userConfig` as in section 3.
 
 `hooks/hooks.json` uses exec form: `{"type":"command","command":"python3","args":["${CLAUDE_PLUGIN_ROOT}/scripts/warmfold.py","<event>"],"timeout":N}`. Verify in the docs that `${CLAUDE_PLUGIN_ROOT}` substitutes inside `args`. If it does not, use `command: "${CLAUDE_PLUGIN_ROOT}/scripts/warmfold.py"` with a `#!/usr/bin/env python3` shebang and `args: ["<event>"]`, and make the file executable.
 
@@ -213,9 +202,7 @@ Real `claude` sessions in tmux, model `claude-haiku-4-5`, `--plugin-dir <repo>`,
 | Case | Setup | Assert |
 |---|---|---|
 | `compact-tmux` | claude inside tmux | transcript gets a `compact_boundary` with `trigger: manual` within 3 min after the turn end; state `phase = compact_sent` |
-| `handoff-plain` | claude inside tmux started with `env -u TMUX -u TMUX_PANE`, so no channel | handoff file exists within 3 min; content has the headings; state `handoff_done` |
-| `guard-cold` | as handoff-plain plus `WARMFOLD_FORCE_TTL_SECONDS=30`; wait 90 s; type a prompt | the pane shows the guard message; the prompt was not sent; a second submit passes |
-| `clear-loads-handoff` | after handoff-plain, type `/clear`, then ask "what is the handoff goal" | the answer quotes the handoff |
+| `guard-cold` | channel forced unavailable plus `WARMFOLD_FORCE_TTL_SECONDS=30`; wait for `compact_deferred`, then past `last_request_start + 30s`; type a prompt | the watcher records `compact_deferred` without fallback injection; the pane shows the guard message; the prompt was not sent; a second submit passes |
 | `status-local` | type `/warmfold:status` | the pane shows the report through a normal assistant response and the command turn appears in the transcript |
 | `zellij` | claude inside a zellij session (`zellij --session warmfold-test`) | same assertion as compact-tmux |
 
@@ -238,21 +225,21 @@ Ledger file: `<data_dir>/ledger.jsonl`, one JSON object per line, append-only, w
 
 Action record (written when the watcher acts):
 ```
-{"type":"action","id":"<uuid>","ts":<epoch>,"action":"compact|handoff|keepalive","session_id":..,"cwd":..,
+{"type":"action","id":"<uuid>","ts":<epoch>,"action":"compact|keepalive","session_id":..,"cwd":..,
  "model":..,"context_tokens":N,"ttl_seconds":N,"cold_at":<epoch>,
  "paid_usd":<warm cost of the action>,"avoid_usd":<cold return cost of the context>}
 ```
-`paid_usd` = `cost.warm_compact_usd` for compact and handoff (both are one warm read plus a short output);
+`paid_usd` = `cost.warm_compact_usd` for compact (one warm read plus a short output);
 keepalive = tokens × cache read price. `avoid_usd` = `cost.cold_return_usd`.
 
 Outcome record (written once per action, at the first user return after the action):
 ```
 {"type":"outcome","ref":"<action id>","ts":<epoch>,"session_id":..,"outcome":"realized|early|paid_cold","saved_usd":<float>}
 ```
-Rules, evaluated in `prompt` (UserPromptSubmit) and `session-start` (matcher `clear`, when a handoff is consumed):
+Rules, evaluated in `prompt` (UserPromptSubmit):
 - `realized`: the return happened after `cold_at` of the action. `saved_usd = avoid_usd - paid_usd - rebuild`, where `rebuild` is the cold cost of the current (compacted or cleared) context when the return is also cold, else 0.
 - `early`: the return happened before `cold_at`. The action was not needed. `saved_usd = -paid_usd`.
-- `paid_cold` (handoff only): the user passed the guard and continued on the old context. `saved_usd = -paid_usd`.
+- `paid_cold` (legacy handoff accounting only): the user passed the guard and continued on the old context. `saved_usd = -paid_usd`.
 Each action gets at most one outcome. Actions without an outcome are `pending`.
 
 Report (`/warmfold:savings`, computed locally by the prompt hook and rendered by Claude; also `python3 warmfold.py savings` for a shell-only report):

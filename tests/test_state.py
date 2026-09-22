@@ -19,7 +19,7 @@ def test_defaults_for_missing_file(tmp_path):
     assert st["wake_count"] == 0
 
 
-def test_save_and_load_roundtrip(tmp_path):
+def test_legacy_handoff_phase_migrates_to_idle(tmp_path):
     st = dict(state.DEFAULTS)
     st["phase"] = "handoff_pending"
     st["armed_token"] = 1234.5
@@ -27,7 +27,21 @@ def test_save_and_load_roundtrip(tmp_path):
     st["cwd"] = "/tmp/work"
     state.save(str(tmp_path), "sess-1", st)
     loaded = state.load(str(tmp_path), "sess-1")
-    assert loaded["phase"] == "handoff_pending"
+    assert loaded["phase"] == "idle"
+    assert loaded["armed_token"] == 1234.5
+    assert loaded["wake_count"] == 3
+    assert loaded["cwd"] == "/tmp/work"
+
+
+def test_save_and_load_roundtrip(tmp_path):
+    st = dict(state.DEFAULTS)
+    st["phase"] = "idle"
+    st["armed_token"] = 1234.5
+    st["wake_count"] = 3
+    st["cwd"] = "/tmp/work"
+    state.save(str(tmp_path), "sess-roundtrip", st)
+    loaded = state.load(str(tmp_path), "sess-roundtrip")
+    assert loaded["phase"] == "idle"
     assert loaded["armed_token"] == 1234.5
     assert loaded["wake_count"] == 3
     assert loaded["cwd"] == "/tmp/work"

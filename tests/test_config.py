@@ -32,8 +32,6 @@ def test_defaults_when_no_overrides():
     assert cfg["guard"] is True
     assert cfg["guard_min_usd"] == 1.0
     assert cfg["guard_ack_seconds"] == 120.0
-    assert cfg["handoff_autoload"] == "clear"
-    assert cfg["handoff_max_age_hours"] == 24.0
     assert cfg["poll_seconds"] == 15.0
     assert cfg["force_ttl_seconds"] == 0.0
     assert cfg["force_channel"] == ""
@@ -155,8 +153,10 @@ def test_bad_enum_values_keep_defaults(monkeypatch):
     assert config.load()["mode"] == "auto"
     monkeypatch.setenv("WARMFOLD_TTL_5M_POLICY", "always")
     assert config.load()["ttl_5m_policy"] == "warn"
-    monkeypatch.setenv("WARMFOLD_HANDOFF_AUTOLOAD", "whenever")
-    assert config.load()["handoff_autoload"] == "clear"
+
+def test_legacy_handoff_mode_migrates_to_auto(monkeypatch):
+    monkeypatch.setenv("WARMFOLD_MODE", "handoff")
+    assert config.load()["mode"] == "auto"
 
 
 def test_invalid_override_keeps_lower_priority_value(monkeypatch, tmp_path):

@@ -247,68 +247,6 @@ def test_watch_cold_exit_sets_phase_cold(monkeypatch, env):
     assert st["expires_at"] == (T - 100) + 60.0
 
 
-def test_watch_due_no_channel_requests_handoff(monkeypatch, env):
-    clock = install_clock(monkeypatch)
-    env.cfg.update(
-        {
-            "idle_minutes": 0,
-            "safety_margin_minutes": 0,
-            "force_ttl_seconds": 3600,
-            "mode": "auto",
-            "force_channel": "none",
-        }
-    )
-    out, code, err = run_watch(monkeypatch, clock, env.cfg, env.payload)
-    assert code == 2
-    assert "handoff summary" in err
-    assert "Goal" in err
-    st = load_state(env)
-    assert st["phase"] == "handoff_pending"
-    assert st["channel"] == "none"
-
-
-def test_watch_handoff_reply_saves_and_does_not_arm(monkeypatch, env):
-    clock = install_clock(monkeypatch)
-    save_state(env, phase="handoff_pending", armed_token=555.0, cwd=str(env.tmp_path))
-    payload = dict(env.payload)
-    payload["last_assistant_message"] = "# Goal\nFinish the refactor.\n"
-    out, code, err = run_watch(monkeypatch, clock, env.cfg, payload)
-    assert code == 0
-    st = load_state(env)
-    assert st["phase"] == "handoff_done"
-    assert st["armed_token"] == 555.0  # not re-armed
-    latest = events.load_latest_handoff(env.cfg, str(env.tmp_path))
-    assert latest is not None
-    assert latest["session_id"] == "sess-test"
-    assert latest["consumed_at"] is None
-    with open(latest["path"], encoding="utf-8") as handle:
-        assert "# Goal" in handle.read()
-    assert "handoff saved" in log_text(env)
-
-
-def test_watch_handoff_save_failure_keeps_pending(monkeypatch, env):
-    clock = install_clock(monkeypatch)
-    save_state(env, phase="handoff_pending", armed_token=555.0, cwd=str(env.tmp_path))
-    payload = dict(env.payload)
-    payload["last_assistant_message"] = "# Goal\nFinish it.\n"
-    real_write = state.write_json_atomic
-
-    def fail_latest(path, obj):
-        if path.endswith("latest.json"):
-            raise OSError("disk full")
-        real_write(path, obj)
-
-    monkeypatch.setattr(state, "write_json_atomic", fail_latest)
-    out, code, err = run_watch(monkeypatch, clock, env.cfg, payload)
-    assert code == 0
-    assert err == ""
-    # the phase stays pending so the next Stop can retry the save
-    assert load_state(env)["phase"] == "handoff_pending"
-    assert "handoff save failed" in log_text(env)
-    latest = events.load_latest_handoff(env.cfg, str(env.tmp_path))
-    assert latest is None
-
-
 def test_watch_keepalive_counts_wakes(monkeypatch, env):
     clock = install_clock(monkeypatch)
     env.cfg.update(
@@ -341,22 +279,6 @@ def test_watch_keepalive_counts_wakes(monkeypatch, env):
     assert st["wake_count"] == 1
     assert st["phase"] == "idle"
     assert st["armed_token"] == pytest.approx(clock.t - 15.0, abs=1)
-
-
-def test_watch_keepalive_budget_spent_falls_back_to_handoff(monkeypatch, env):
-    clock = install_clock(monkeypatch)
-    env.cfg.update(
-        {
-            "mode": "keepalive",
-            "keepalive_hours": 0.0,
-            "idle_minutes": 0,
-            "safety_margin_minutes": 0,
-            "force_ttl_seconds": 3600,
-        }
-    )
-    out, code, err = run_watch(monkeypatch, clock, env.cfg, env.payload)
-    assert code == 2
-    assert load_state(env)["phase"] == "handoff_pending"
 
 
 def test_watch_ttl_5m_warn_does_nothing(monkeypatch, env):
@@ -404,7 +326,7 @@ def test_watch_ttl_5m_compact_at_4m_acts_before_expiry(monkeypatch, env):
     clock = install_clock(monkeypatch, start=T)
     env.cfg.update(
         {
-            "mode": "handoff",
+            "mode": "compact",
             "force_channel": "none",
             "safety_margin_minutes": 0,
             "ttl_5m_policy": "compact_at_4m",
@@ -412,9 +334,9 @@ def test_watch_ttl_5m_compact_at_4m_acts_before_expiry(monkeypatch, env):
         }
     )
     out, code, err = run_watch(monkeypatch, clock, env.cfg, env.payload)
-    assert code == 2
-    assert load_state(env)["phase"] == "handoff_pending"
-    assert "handoff summary" in err
+    assert code == 0
+    assert load_state(env)["phase"] == "compact_deferred"
+    assert "deferred" in log_text(env)
 
 
 def test_watch_ttl_5m_compact_at_4m_with_default_margin(monkeypatch, env):
@@ -427,19 +349,19 @@ def test_watch_ttl_5m_compact_at_4m_with_default_margin(monkeypatch, env):
     clock = install_clock(monkeypatch, start=T)
     env.cfg.update(
         {
-            "mode": "handoff",
+            "mode": "compact",
             "force_channel": "none",
             "ttl_5m_policy": "compact_at_4m",
             "poll_seconds": 15,
         }
     )
     out, code, err = run_watch(monkeypatch, clock, env.cfg, env.payload)
-    assert code == 2
+    assert code == 0
     st = load_state(env)
-    assert st["phase"] == "handoff_pending"
+    assert st["phase"] == "compact_deferred"
     # expires_at is the action deadline, not the cold time
     assert st["expires_at"] == (T - 5.0) + 300.0 - 60.0
-    assert "handoff summary" in err
+    assert "deferred" in log_text(env)
 
 
 def test_watch_small_context_takes_no_action(monkeypatch, env):
@@ -453,7 +375,7 @@ def test_watch_small_context_takes_no_action(monkeypatch, env):
             "idle_minutes": 0,
             "safety_margin_minutes": 0,
             "force_ttl_seconds": 3600,
-            "mode": "handoff",
+            "mode": "compact",
         }
     )
     out, code, err = run_watch(monkeypatch, clock, env.cfg, env.payload)
@@ -473,7 +395,7 @@ def test_watch_unknown_auth_assumes_5m(monkeypatch, env):
         ],
     )
     env.cfg.update(
-        {"idle_minutes": 0, "safety_margin_minutes": 0, "mode": "handoff"}
+        {"idle_minutes": 0, "safety_margin_minutes": 0, "mode": "compact"}
     )
     out, code, err = run_watch(monkeypatch, clock, env.cfg, env.payload)
     assert code == 0
@@ -493,12 +415,12 @@ def test_watch_env_ttl_1h_detected_and_logged(monkeypatch, env):
     )
     monkeypatch.setenv("ENABLE_PROMPT_CACHING_1H", "1")
     env.cfg.update(
-        {"idle_minutes": 0, "safety_margin_minutes": 0, "mode": "handoff"}
+        {"idle_minutes": 0, "safety_margin_minutes": 0, "mode": "compact"}
     )
     out, code, err = run_watch(monkeypatch, clock, env.cfg, env.payload)
-    assert code == 2
+    assert code == 0
     assert "ttl=3600s (env ENABLE_PROMPT_CACHING_1H)" in log_text(env)
-    assert load_state(env)["phase"] == "handoff_pending"
+    assert load_state(env)["phase"] == "compact_deferred"
 
 
 def test_watch_5m_policy_applies_to_env_detected_ttl(monkeypatch, env):
@@ -514,16 +436,16 @@ def test_watch_5m_policy_applies_to_env_detected_ttl(monkeypatch, env):
     clock = install_clock(monkeypatch, start=T)
     env.cfg.update(
         {
-            "mode": "handoff",
+            "mode": "compact",
             "force_channel": "none",
             "ttl_5m_policy": "compact_at_4m",
             "poll_seconds": 15,
         }
     )
     out, code, err = run_watch(monkeypatch, clock, env.cfg, env.payload)
-    assert code == 2
+    assert code == 0
     assert "ttl=300s (env CLAUDE_CODE_PROMPT_CACHE_TTL)" in log_text(env)
-    assert load_state(env)["phase"] == "handoff_pending"
+    assert load_state(env)["phase"] == "compact_deferred"
 
 
 def test_watch_project_setting_drives_ttl(monkeypatch, env):
@@ -543,12 +465,12 @@ def test_watch_project_setting_drives_ttl(monkeypatch, env):
         {"promptCacheTtl": "1h"},
     )
     env.cfg.update(
-        {"idle_minutes": 0, "safety_margin_minutes": 0, "mode": "handoff"}
+        {"idle_minutes": 0, "safety_margin_minutes": 0, "mode": "compact"}
     )
     out, code, err = run_watch(monkeypatch, clock, env.cfg, env.payload)
-    assert code == 2
+    assert code == 0
     assert "ttl=3600s (setting promptCacheTtl)" in log_text(env)
-    assert load_state(env)["phase"] == "handoff_pending"
+    assert load_state(env)["phase"] == "compact_deferred"
 
 
 def test_prompt_guard_uses_project_dir_ttl(monkeypatch, env):
@@ -602,10 +524,11 @@ def test_status_report_uses_saved_state_cwd_for_ttl(monkeypatch, env):
     assert "TTL: 5m (setting promptCacheTtl)" in out
 
 
-def install_stub_channel(monkeypatch, inject_result=True, name="stub"):
+def install_stub_channel(monkeypatch, inject_result=True, name="stub", outcome=None):
     class StubChannel:
         def __init__(self):
             self.name = name
+            self.outcome = outcome
 
         def capture(self):
             return ""
@@ -646,7 +569,7 @@ def test_watch_auto_uses_compact_channel(monkeypatch, env):
     assert st["last_action_at"] > 0
 
 
-def test_watch_compact_failure_falls_back_to_handoff(monkeypatch, env):
+def test_watch_compact_failure_defers(monkeypatch, env):
     clock = install_clock(monkeypatch)
     install_stub_channel(monkeypatch, inject_result=False)
     env.cfg.update(
@@ -659,10 +582,11 @@ def test_watch_compact_failure_falls_back_to_handoff(monkeypatch, env):
         }
     )
     out, code, err = run_watch(monkeypatch, clock, env.cfg, env.payload)
-    assert code == 2
+    assert code == 0
     st = load_state(env)
-    assert st["phase"] == "handoff_pending"
-    assert "fall back to handoff" in log_text(env)
+    assert st["phase"] == "compact_deferred"
+    assert "deferred" in log_text(env)
+    assert ledger.load(env.data_dir) == []
 
 
 def test_watch_channel_none_disables_detection(monkeypatch, env):
@@ -702,6 +626,33 @@ def test_t3_channel_requires_exact_payload_identity_and_preserves_uncertain(
     assert seen == {"session": "sdk-session", "cwd": str(env.tmp_path), "db": None}
     assert channel.inject_compact() is False
     assert channel.outcome == "uncertain"
+
+    clock = install_clock(monkeypatch)
+    env.cfg.update(
+        {"mode": "compact", "force_channel": "t3", "idle_minutes": 0,
+         "safety_margin_minutes": 0, "force_ttl_seconds": 3600}
+    )
+    run_watch(monkeypatch, clock, env.cfg, env.payload)
+    assert load_state(env)["phase"] == "compact_pending"
+    assert ledger.load(env.data_dir) == []
+
+
+@pytest.mark.parametrize("outcome", ["deferred", "rejected"])
+def test_watch_nonaccepted_native_outcomes_defer_without_ledger(
+    monkeypatch, env, outcome
+):
+    clock = install_clock(monkeypatch)
+    install_stub_channel(monkeypatch, inject_result=False, outcome=outcome)
+    env.cfg.update(
+        {"mode": "compact", "force_channel": "", "idle_minutes": 0,
+         "safety_margin_minutes": 0,
+         "force_ttl_seconds": 3600}
+    )
+    run_watch(monkeypatch, clock, env.cfg, env.payload)
+    st = load_state(env)
+    assert st["phase"] == "compact_deferred"
+    assert st["channel"] == "stub"
+    assert ledger.load(env.data_dir) == []
 
 
 def test_watch_no_rearm_after_postcompact_in_same_idle_period(monkeypatch, env):
@@ -855,8 +806,8 @@ def install_race_lock(monkeypatch, interfere):
     monkeypatch.setattr(events, "_session_lock", wrapped)
 
 
-HANDOFF_DUE_CFG = {
-    "mode": "handoff",
+NATIVE_DUE_CFG = {
+    "mode": "compact",
     "idle_minutes": 0,
     "safety_margin_minutes": 0,
     "force_ttl_seconds": 3600,
@@ -868,7 +819,7 @@ def test_watch_rival_rearm_blocks_action(monkeypatch, env):
     # Watcher B re-arms between A's due decision and A's action. A must
     # drop out under the lock: no stderr wake, no state overwrite.
     clock = install_clock(monkeypatch)
-    env.cfg.update(HANDOFF_DUE_CFG)
+    env.cfg.update(NATIVE_DUE_CFG)
     rival_token = clock.t + 1.0
 
     def rival_watcher_b():
@@ -892,7 +843,7 @@ def test_watch_user_activity_blocks_action(monkeypatch, env):
     # The user types between A's due decision and A's action. A must not
     # wake the terminal after fresh user activity.
     clock = install_clock(monkeypatch)
-    env.cfg.update(HANDOFF_DUE_CFG)
+    env.cfg.update(NATIVE_DUE_CFG)
     typed_at = clock.t + 5.0
 
     def user_types_mid_race():
@@ -917,7 +868,7 @@ def test_watch_exits_after_post_compact_during_watch(monkeypatch, env):
     clock = install_clock(monkeypatch)
     env.cfg.update(
         {
-            "mode": "handoff",
+            "mode": "compact",
             "idle_minutes": 30,
             "safety_margin_minutes": 0,
             "force_ttl_seconds": 3600,
@@ -995,19 +946,6 @@ def test_prompt_guard_blocks_first_cold_submit(monkeypatch, env):
     assert out3["decision"] == "block"
 
 
-def test_prompt_guard_mentions_fresh_handoff(monkeypatch, env):
-    install_clock(monkeypatch)
-    env.cfg["force_ttl_seconds"] = 3600
-    write_transcript(env.tpath, [user_line(T - 4000), asst_line(T - 3990)])
-    events.save_handoff(
-        env.cfg, "sess-old", str(env.tmp_path), "# Goal\nold work\n", when=T - 600
-    )
-    out, _ = events.prompt(dict(env.payload, prompt="go on"), env.cfg)
-    assert out is not None
-    assert "handoff from" in out["reason"]
-    assert str(env.tmp_path) in out["reason"]
-
-
 def test_prompt_guard_passes_when_warm(monkeypatch, env):
     install_clock(monkeypatch)
     env.cfg["force_ttl_seconds"] = 3600
@@ -1069,82 +1007,6 @@ def start_payload(env, source, session="sess-new"):
         "transcript_path": env.tpath,
         "cwd": str(env.tmp_path),
     }
-
-
-def test_session_start_clear_loads_handoff(monkeypatch, env):
-    install_clock(monkeypatch)
-    events.save_handoff(
-        env.cfg, "sess-old", str(env.tmp_path), "# Goal\nFinish it.\n", when=T - 600
-    )
-    out, code = events.session_start(start_payload(env, "clear"), env.cfg)
-    assert code == 0
-    assert out["hookSpecificOutput"]["hookEventName"] == "SessionStart"
-    ctx = out["hookSpecificOutput"]["additionalContext"]
-    assert "# Goal" in ctx
-    assert "Finish it." in ctx
-    assert out["systemMessage"].startswith("warmfold: loaded handoff from")
-    latest = events.load_latest_handoff(env.cfg, str(env.tmp_path))
-    assert latest["consumed_at"] is not None
-
-    # a second clear does not inject again
-    out2, _ = events.session_start(start_payload(env, "clear", "sess-new2"), env.cfg)
-    assert out2 is None
-
-
-def test_session_start_ignores_stale_handoff(monkeypatch, env):
-    install_clock(monkeypatch)
-    events.save_handoff(
-        env.cfg, "sess-old", str(env.tmp_path), "# Goal\nold\n", when=T - 25 * 3600
-    )
-    out, _ = events.session_start(start_payload(env, "clear"), env.cfg)
-    assert out is None
-    latest = events.load_latest_handoff(env.cfg, str(env.tmp_path))
-    assert latest["consumed_at"] is None
-
-
-def test_session_start_startup_shows_pointer_only(monkeypatch, env):
-    install_clock(monkeypatch)
-    events.save_handoff(
-        env.cfg, "sess-old", str(env.tmp_path), "# Goal\nsecret plan\n", when=T - 600
-    )
-    out, _ = events.session_start(start_payload(env, "startup"), env.cfg)
-    ctx = out["hookSpecificOutput"]["additionalContext"]
-    assert ctx.startswith("A warmfold handoff from")
-    assert "Read it only if the user continues that work." in ctx
-    assert "secret plan" not in ctx
-    latest = events.load_latest_handoff(env.cfg, str(env.tmp_path))
-    assert latest["consumed_at"] is None  # not consumed by the pointer
-
-
-def test_session_start_startup_full_load_when_configured(monkeypatch, env):
-    install_clock(monkeypatch)
-    env.cfg["handoff_autoload"] = "clear+startup"
-    events.save_handoff(
-        env.cfg, "sess-old", str(env.tmp_path), "# Goal\nsecret plan\n", when=T - 600
-    )
-    out, _ = events.session_start(start_payload(env, "startup"), env.cfg)
-    assert "secret plan" in out["hookSpecificOutput"]["additionalContext"]
-    latest = events.load_latest_handoff(env.cfg, str(env.tmp_path))
-    assert latest["consumed_at"] is not None
-
-
-def test_session_start_autoload_off(monkeypatch, env):
-    install_clock(monkeypatch)
-    env.cfg["handoff_autoload"] = "off"
-    events.save_handoff(
-        env.cfg, "sess-old", str(env.tmp_path), "# Goal\nx\n", when=T - 600
-    )
-    out, _ = events.session_start(start_payload(env, "clear"), env.cfg)
-    assert out is None
-
-
-def test_session_start_resume_does_not_inject(monkeypatch, env):
-    install_clock(monkeypatch)
-    events.save_handoff(
-        env.cfg, "sess-old", str(env.tmp_path), "# Goal\nx\n", when=T - 600
-    )
-    out, _ = events.session_start(start_payload(env, "resume"), env.cfg)
-    assert out is None
 
 
 def test_session_start_resets_watcher_state(monkeypatch, env):
@@ -1295,24 +1157,8 @@ def test_status_report_fields(monkeypatch, env):
         "Next action:",
         "Cold return cost: $1.60",
         "Warm compaction cost: $0.11",
-        "Handoff: none",
     ):
         assert fragment in out, fragment
-
-
-def test_status_report_shows_handoff_path(monkeypatch, env):
-    install_clock(monkeypatch)
-    save_state(
-        env,
-        armed_token=T - 300.0,
-        transcript_path=env.tpath,
-        cwd=str(env.tmp_path),
-    )
-    path = events.save_handoff(
-        env.cfg, "sess-old", str(env.tmp_path), "# Goal\nx\n", when=T - 100
-    )
-    out, _ = events.status({}, env.cfg)
-    assert "Handoff: %s" % path in out
 
 
 # ---------------------------------------------------------------------------
@@ -1325,27 +1171,6 @@ WATCH_DUE_CFG = {
     "safety_margin_minutes": 0,
     "force_ttl_seconds": 3600,
 }
-
-
-def test_watch_handoff_writes_ledger_action(monkeypatch, env):
-    clock = install_clock(monkeypatch)
-    env.cfg.update(dict(WATCH_DUE_CFG, force_channel="none"))
-    out, code, err = run_watch(monkeypatch, clock, env.cfg, env.payload)
-    assert code == 2  # the deliberate handoff wake
-    records = ledger.load(env.data_dir)
-    assert len(records) == 1
-    act = records[0]
-    assert act["type"] == "action"
-    assert act["action"] == "handoff"
-    assert act["session_id"] == "sess-test"
-    assert act["cwd"] == str(env.tmp_path)
-    assert act["model"] == "claude-sonnet-5"
-    assert act["context_tokens"] == 400000
-    assert act["ttl_seconds"] == 3600
-    assert act["ts"] == pytest.approx(T + 15.0)  # the first 15 s poll
-    assert act["cold_at"] == pytest.approx(T - 100.0 + 3600.0)
-    assert act["paid_usd"] == pytest.approx(0.11)
-    assert act["avoid_usd"] == pytest.approx(1.6)
 
 
 def test_watch_compact_writes_ledger_action(monkeypatch, env):
@@ -1374,37 +1199,6 @@ def test_watch_keepalive_writes_ledger_action(monkeypatch, env):
     # keepalive pays only the cache read: 400k tokens at $0.20/MTok
     assert records[0]["paid_usd"] == pytest.approx(0.08)
     assert records[0]["avoid_usd"] == pytest.approx(1.6)
-
-
-def test_watch_compact_failure_writes_only_the_handoff_record(monkeypatch, env):
-    clock = install_clock(monkeypatch)
-    install_stub_channel(monkeypatch, inject_result=False)
-    env.cfg.update(dict(WATCH_DUE_CFG, force_channel=""))
-    out, code, err = run_watch(monkeypatch, clock, env.cfg, env.payload)
-    assert code == 2
-    assert load_state(env)["phase"] == "handoff_pending"
-    # the failed compact must not leave a phantom action record
-    assert [r["action"] for r in ledger.load(env.data_dir)] == ["handoff"]
-
-
-def test_prompt_settles_early_outcome_once(monkeypatch, env):
-    clock = install_clock(monkeypatch)
-    env.cfg.update(dict(WATCH_DUE_CFG, force_channel="none"))
-    run_watch(monkeypatch, clock, env.cfg, env.payload)
-    # the user returns while the 1h cache is still warm
-    out, code = events.prompt(dict(env.payload, prompt="continue"), env.cfg)
-    assert (out, code) == (None, 0)
-    records = ledger.load(env.data_dir)
-    outcomes = [r for r in records if r["type"] == "outcome"]
-    assert len(outcomes) == 1
-    assert outcomes[0]["outcome"] == "early"
-    assert outcomes[0]["ref"] == records[0]["id"]
-    assert outcomes[0]["session_id"] == "sess-test"
-    assert outcomes[0]["saved_usd"] == pytest.approx(-0.11)
-    # a second prompt must not settle the same action again
-    events.prompt(dict(env.payload, prompt="again"), env.cfg)
-    outcomes = [r for r in ledger.load(env.data_dir) if r["type"] == "outcome"]
-    assert len(outcomes) == 1
 
 
 def test_prompt_settles_paid_cold_on_guard_pass(monkeypatch, env):
@@ -1473,59 +1267,6 @@ def test_prompt_settles_realized_with_rebuild(monkeypatch, env):
     # avoid 1.60 - paid 0.11 - rebuild (1k tokens at the 1h write rate 4
     # $/MTok = 0.004)
     assert outcomes[0]["saved_usd"] == pytest.approx(1.486)
-
-
-def test_session_start_clear_settles_consumed_handoff_cold(monkeypatch, env):
-    install_clock(monkeypatch)
-    ledger.append_action(
-        env.data_dir,
-        ts=T - 100.0,
-        action="handoff",
-        session_id="sess-old",
-        cwd=str(env.tmp_path),
-        model="claude-sonnet-5",
-        context_tokens=400000,
-        ttl_seconds=3600,
-        cold_at=T - 10.0,
-        paid_usd=0.11,
-        avoid_usd=1.6,
-    )
-    events.save_handoff(
-        env.cfg, "sess-old", str(env.tmp_path), "# Goal\nx\n", when=T - 100
-    )
-    out, _ = events.session_start(start_payload(env, "clear"), env.cfg)
-    assert out is not None  # the handoff text is injected
-    outcomes = [r for r in ledger.load(env.data_dir) if r["type"] == "outcome"]
-    assert len(outcomes) == 1
-    assert outcomes[0]["outcome"] == "realized"
-    # the cleared context is never rebuilt, so the rebuild term is zero
-    assert outcomes[0]["saved_usd"] == pytest.approx(1.49)
-    assert outcomes[0]["session_id"] == "sess-old"
-
-
-def test_session_start_clear_settles_consumed_handoff_early(monkeypatch, env):
-    install_clock(monkeypatch)
-    ledger.append_action(
-        env.data_dir,
-        ts=T - 100.0,
-        action="handoff",
-        session_id="sess-old",
-        cwd=str(env.tmp_path),
-        model="claude-sonnet-5",
-        context_tokens=400000,
-        ttl_seconds=3600,
-        cold_at=T + 1000.0,
-        paid_usd=0.11,
-        avoid_usd=1.6,
-    )
-    events.save_handoff(
-        env.cfg, "sess-old", str(env.tmp_path), "# Goal\nx\n", when=T - 100
-    )
-    out, _ = events.session_start(start_payload(env, "clear"), env.cfg)
-    assert out is not None
-    outcomes = [r for r in ledger.load(env.data_dir) if r["type"] == "outcome"]
-    assert [r["outcome"] for r in outcomes] == ["early"]
-    assert outcomes[0]["saved_usd"] == pytest.approx(-0.11)
 
 
 def test_prompt_report_commands_follow_normal_bookkeeping(monkeypatch, env):
@@ -1682,38 +1423,6 @@ def test_prompt_realized_marks_estimate_without_transcript(monkeypatch, env):
     assert outcomes(env)[0]["estimate"] == "no transcript"
 
 
-def test_session_start_settle_failure_keeps_handoff_unconsumed(monkeypatch, env):
-    # The outcome must land before the handoff is marked consumed; a
-    # failed append leaves the pointer untouched so the next clear retries.
-    install_clock(monkeypatch)
-    append_handoff_action(
-        env, session_id="sess-old", ts=T - 100.0, cold_at=T - 10.0
-    )
-    events.save_handoff(
-        env.cfg, "sess-old", str(env.tmp_path), "# Goal\nx\n", when=T - 100
-    )
-    real_append = ledger.append_record
-
-    def broken_append(data_dir, record):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(ledger, "append_record", broken_append)
-    out, _ = events.session_start(start_payload(env, "clear"), env.cfg)
-    assert out is not None  # the user still gets the handoff text
-    latest = events.load_latest_handoff(env.cfg, str(env.tmp_path))
-    assert latest["consumed_at"] is None
-    assert "ledger outcome failed" in log_text(env)
-
-    monkeypatch.setattr(ledger, "append_record", real_append)
-    out2, _ = events.session_start(start_payload(env, "clear"), env.cfg)
-    assert out2 is not None
-    latest = events.load_latest_handoff(env.cfg, str(env.tmp_path))
-    assert latest["consumed_at"] is not None
-    settled = outcomes(env)
-    assert [r["outcome"] for r in settled] == ["realized"]
-    assert settled[0]["saved_usd"] == pytest.approx(1.49)
-
-
 def test_savings_interception_survives_a_corrupt_ledger(monkeypatch, env):
     install_clock(monkeypatch)
     write_raw_ledger(env, {
@@ -1742,22 +1451,6 @@ def test_broken_report_reaches_claude_as_a_useful_response(monkeypatch, env):
     assert "decision" not in out
     assert "suppressOriginalPrompt" not in out
     assert "warmfold: report failed: boom" in out["hookSpecificOutput"]["additionalContext"]
-
-
-def test_watch_handoff_reply_stores_the_action_id(monkeypatch, env):
-    clock = install_clock(monkeypatch)
-    env.cfg.update(dict(WATCH_DUE_CFG, force_channel="none"))
-    run_watch(monkeypatch, clock, env.cfg, env.payload)  # acts: handoff pending
-    save_state(
-        env, phase="handoff_pending", armed_token=clock.t, cwd=str(env.tmp_path)
-    )
-    payload = dict(env.payload, last_assistant_message="# Goal\nFinish it.\n")
-    out, code, err = run_watch(monkeypatch, clock, env.cfg, payload)
-    assert code == 0
-    latest = events.load_latest_handoff(env.cfg, str(env.tmp_path))
-    records = ledger.load(env.data_dir)
-    assert [r["type"] for r in records] == ["action"]
-    assert latest["action_id"] == records[0]["id"]
 
 
 def write_raw_ledger(env, obj):

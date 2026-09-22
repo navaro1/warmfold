@@ -30,8 +30,6 @@ DEFAULTS = {
 _PHASES = frozenset(
     (
         "idle",
-        "handoff_pending",
-        "handoff_done",
         "keepalive_pending",
         "compact_sent",
         "compact_pending",
@@ -61,6 +59,10 @@ def _is_number(value):
 def _validated(key, value):
     """Return value fitted to the key's type, or the default on mismatch."""
     if key == "phase":
+        # Old sessions can contain handoff phases. They are terminal legacy
+        # state, never an instruction to write or inject a handoff.
+        if value in ("handoff_pending", "handoff_done"):
+            return "idle"
         return value if value in _PHASES else "idle"
     if key in _FLOAT_KEYS:
         return float(value) if _is_number(value) else 0.0
