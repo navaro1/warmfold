@@ -186,6 +186,22 @@ class SequenceFake(FakeRun):
             handle.write(text)
 
 
+class TerminalSequenceFake(SequenceFake):
+    """Terminal.app scripting fake: capture by tty, submit in one call."""
+
+    def serve(self, cmd):
+        if cmd and cmd[0] == "osascript":
+            if len(cmd) == 3:
+                self.fire_raises(" ".join(cmd))
+                return FakeProc(
+                    stdout=self.states[min(self.stage, len(self.states) - 1)].encode()
+                )
+            self.advance()
+            self.fire_raises(" ".join(cmd))
+            return FakeProc(stdout=b"ok\n")
+        return SequenceFake.serve(self, cmd)
+
+
 class FileFake(FakeRun):
     """FakeRun that writes dump_text into the dump file the command names.
 
@@ -217,6 +233,7 @@ ALL_ENV_KEYS = [
     "KITTY_LISTEN_ON",
     "STY",
     "WINDOW",
+    "TERM_PROGRAM",
 ]
 
 
@@ -882,6 +899,361 @@ def test_screen_requires_window(monkeypatch):
     monkeypatch.setenv("STY", "warmfold-sty")
     assert channels.ScreenChannel.available() is False
     assert channels.ScreenChannel.missing_env() == ["WINDOW"]
+
+
+def test_terminal_app_targets_parent_tty_and_submits_complete_command(monkeypatch):
+    clear_env(monkeypatch)
+    monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+    monkeypatch.setattr(channels.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(channels.shutil, "which", lambda name: "/usr/bin/osascript")
+    monkeypatch.setattr(channels, "_mac_terminal_tty", lambda: "ttys123")
+    fake = TerminalSequenceFake([PROMPT_SCREEN, COMPACTED_SCREEN])
+    patch_run(monkeypatch, fake)
+    patch_sleep(monkeypatch, [])
+    channel = channels.TerminalChannel([MARKER])
+
+    assert channel.inject_compact() is True
+    calls = fake.calls
+    assert calls[0]["cmd"] == ["osascript", "-", "ttys123"]
+    assert calls[1]["cmd"][:4] == ["osascript", "-", "ttys123", "/compact"]
+    assert b"do script commandText in t" in calls[1]["input"]
+    assert b"activate" not in calls[1]["input"]
+
+
+def test_terminal_app_refuses_nonempty_prompt_without_sending(monkeypatch):
+    clear_env(monkeypatch)
+    monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+    monkeypatch.setattr(channels.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(channels.shutil, "which", lambda name: "/usr/bin/osascript")
+    monkeypatch.setattr(channels, "_mac_terminal_tty", lambda: "ttys123")
+    fake = TerminalSequenceFake([framed_box("draft")])
+    patch_run(monkeypatch, fake)
+    channel = channels.TerminalChannel([MARKER])
+
+    assert channel.inject_compact() is False
+    assert channel.outcome == "deferred"
+    assert len(fake.calls) == 1
+    assert fake.calls[0]["cmd"] == ["osascript", "-", "ttys123"]
+
+
+def test_terminal_app_same_post_capture_is_uncertain(monkeypatch):
+    clear_env(monkeypatch)
+    monkeypatch.setenv("TERM_PROGRAM", "Apple_Terminal")
+    monkeypatch.setattr(channels.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(channels.shutil, "which", lambda name: "/usr/bin/osascript")
+    monkeypatch.setattr(channels, "_mac_terminal_tty", lambda: "ttys123")
+    fake = TerminalSequenceFake([PROMPT_SCREEN, PROMPT_SCREEN])
+    patch_run(monkeypatch, fake)
+    patch_sleep(monkeypatch, [])
+    channel = channels.TerminalChannel([MARKER])
+
+    assert channel.inject_compact() is False
+    assert channel.outcome == "uncertain"
+
+
+def test_terminal_capture_logs_bounded_stderr_on_failure(monkeypatch):
+    clear_env(monkeypatch)
+    channel = channels.TerminalChannel([MARKER])
+    lines = []
+    channel.log = lines.append
+    channel._osascript = lambda script, *args: FakeProc(
+        returncode=1,
+        stdout=b"screen contents must never be logged",
+        stderr=b"Not authorized to send Apple events\n",
+    )
+
+    assert channel.capture() is None
+    assert lines == ["terminal capture exited 1: Not authorized to send Apple events"]
+    assert "screen contents" not in lines[0]
+
+
+def test_terminal_app_requires_macos_osascript_and_parent_tty(monkeypatch):
+    clear_env(monkeypatch)
+    monkeypatch.setattr(channels.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(channels.shutil, "which", lambda name: None)
+    monkeypatch.setattr(channels, "_mac_terminal_tty", lambda: "")
+    assert channels.TerminalChannel.available() is False
+
+
+def test_ghostty_identifies_one_terminal_by_temporary_title(monkeypatch):
+    clear_env(monkeypatch)
+    monkeypatch.setenv("TERM_PROGRAM", "ghostty")
+    monkeypatch.setattr(channels.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(channels, "_mac_terminal_tty", lambda: "ttys123")
+    monkeypatch.setattr(channels.shutil, "which", lambda name: "/usr/bin/" + name)
+    fake = FakeRun()
+    fake.once("osascript", stdout=b"terminal-uuid\n")
+    patch_run(monkeypatch, fake)
+    channel = channels.GhosttyChannel([MARKER])
+
+    writes = []
+    monkeypatch.setattr(
+        channels, "_write_tty", lambda data, tty, log: writes.append((data, tty)) or True
+    )
+    assert channel._identify() is True
+    assert channel.terminal_id == "terminal-uuid"
+    assert writes[0][1] == "ttys123"
+    assert writes[0][0].startswith(b"\x1b[22;0t\x1b]2;warmfold-")
+    assert writes[-1] == (b"\x1b[23;0t", "ttys123")
+    assert b"matches" in fake.calls[0]["input"]
+    assert channel.nonce in fake.calls[0]["cmd"]
+
+
+def test_ghostty_identify_logs_bounded_stderr_on_failure(monkeypatch):
+    clear_env(monkeypatch)
+    monkeypatch.setenv("TERM_PROGRAM", "ghostty")
+    monkeypatch.setattr(channels.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(channels, "_mac_terminal_tty", lambda: "ttys123")
+    channel = channels.GhosttyChannel([MARKER])
+    lines = []
+    channel.log = lines.append
+    monkeypatch.setattr(channels, "_write_tty", lambda *args: True)
+    channel._script = lambda script, *args: FakeProc(
+        returncode=1, stdout=b"screen contents", stderr=b"Apple event denied\n"
+    )
+
+    assert channel._identify() is False
+    assert lines == ["ghostty identify exited 1: Apple event denied"]
+    assert "screen contents" not in lines[0]
+
+
+def test_ghostty_rejects_unsafe_screen_file(monkeypatch, tmp_path):
+    clear_env(monkeypatch)
+    monkeypatch.setenv("TERM_PROGRAM", "ghostty")
+    monkeypatch.setattr(channels.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(channels, "_mac_terminal_tty", lambda: "ttys123")
+    monkeypatch.setattr(channels.shutil, "which", lambda name: "/usr/bin/" + name)
+    fake = FakeRun()
+    fake.always("pbpaste", stdout=str(tmp_path / "outside").encode())
+    fake.always("osascript", stdout=b"ok\n")
+    patch_run(monkeypatch, fake)
+    channel = channels.GhosttyChannel([MARKER])
+    channel.terminal_id = "terminal-uuid"
+
+    assert channel.capture() is None
+
+
+def test_ghostty_never_unlinks_preexisting_clipboard_path(monkeypatch, tmp_path):
+    clear_env(monkeypatch)
+    monkeypatch.setenv("TERM_PROGRAM", "ghostty")
+    monkeypatch.setattr(channels.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(channels, "_mac_terminal_tty", lambda: "ttys123")
+    monkeypatch.setattr(channels.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(channels, "_write_tty", lambda data, tty, log: True)
+    old_path = tmp_path / "old-screen.txt"
+    old_path.write_text("old", encoding="utf-8")
+    os.utime(old_path, (1, 1))
+    snapshots = iter(
+        [
+            {"changeCount": "1", "items": [], "text": "old"},
+            {"changeCount": "2", "items": [], "text": str(old_path)},
+            {"changeCount": "2", "items": [], "text": str(old_path)},
+        ]
+    )
+    monkeypatch.setattr(
+        channels,
+        "_pasteboard_snapshot",
+        lambda log: next(snapshots, {"changeCount": "2", "items": [], "text": str(old_path)}),
+    )
+    monkeypatch.setattr(channels, "_pasteboard_restore", lambda *args, **kwargs: True)
+    fake = FakeRun()
+    fake.always("osascript", stdout=b"ok\n")
+    patch_run(monkeypatch, fake)
+    channel = channels.GhosttyChannel([MARKER])
+    channel.terminal_id = "terminal-uuid"
+
+    assert channel.capture() is None
+    assert old_path.exists()
+
+
+def test_ghostty_reads_native_screen_file_and_restores_all_clipboard_types(
+    monkeypatch, tmp_path
+):
+    clear_env(monkeypatch)
+    monkeypatch.setenv("TERM_PROGRAM", "ghostty")
+    monkeypatch.setattr(channels.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(channels, "_mac_terminal_tty", lambda: "ttys123")
+    monkeypatch.setattr(channels.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(channels.tempfile, "gettempdir", lambda: str(tmp_path))
+    capture_dir = tmp_path / ("A" * 22)
+    capture_dir.mkdir()
+    screen_path = capture_dir / "screen.txt"
+    screen_path.write_text(PROMPT_SCREEN, encoding="utf-8")
+    screen_path.chmod(0o600)
+    before = {
+        "changeCount": "41",
+        "items": [{"type": "public.html", "b64": "PGI+b2xkPC9iPg=="}],
+        "text": "old",
+    }
+    after = {
+        "changeCount": "42",
+        "items": [{"type": "public.utf8-plain-text", "b64": ""}],
+        "text": str(screen_path),
+    }
+    current = dict(after)
+    snapshots = iter([before, after, current])
+    restored = []
+    monkeypatch.setattr(
+        channels,
+        "_pasteboard_snapshot",
+        lambda log: next(snapshots, current),
+    )
+    monkeypatch.setattr(
+        channels,
+        "_pasteboard_restore",
+        lambda snapshot, log, expected_change_count=None: restored.append(snapshot) or True,
+    )
+    monkeypatch.setattr(channels.time, "time_ns", lambda: 0)
+    monkeypatch.setattr(channels, "_write_tty", lambda data, tty, log: True)
+    fake = FakeRun()
+    fake.always("osascript", stdout=b"ok\n")
+    patch_run(monkeypatch, fake)
+    channel = channels.GhosttyChannel([MARKER])
+    channel.terminal_id = "terminal-uuid"
+
+    assert channel.capture() == PROMPT_SCREEN
+    assert restored == [before]
+    assert screen_path.exists()
+    assert any(b"write_screen_file:copy" in call["input"] for call in fake.calls)
+
+
+def test_ghostty_preserves_fresh_unrelated_temp_file(monkeypatch, tmp_path):
+    clear_env(monkeypatch)
+    monkeypatch.setenv("TERM_PROGRAM", "ghostty")
+    monkeypatch.setattr(channels.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(channels, "_mac_terminal_tty", lambda: "ttys123")
+    monkeypatch.setattr(channels.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(channels, "_write_tty", lambda data, tty, log: True)
+    unrelated = tmp_path / "unrelated-screen.txt"
+    unrelated.write_text("user file", encoding="utf-8")
+    snapshots = iter(
+        [
+            {"changeCount": "1", "items": [], "text": "old"},
+            {"changeCount": "2", "items": [], "text": str(unrelated)},
+        ]
+    )
+    monkeypatch.setattr(
+        channels,
+        "_pasteboard_snapshot",
+        lambda log: next(
+            snapshots,
+            {"changeCount": "2", "items": [], "text": str(unrelated)},
+        ),
+    )
+    monkeypatch.setattr(channels, "_pasteboard_restore", lambda *args, **kwargs: True)
+    fake = FakeRun()
+    fake.always("osascript", stdout=b"ok\n")
+    patch_run(monkeypatch, fake)
+    channel = channels.GhosttyChannel([MARKER])
+    channel.terminal_id = "terminal-uuid"
+
+    assert channel.capture() is None
+    assert unrelated.exists()
+
+
+def test_ghostty_rejects_stale_or_unchanged_clipboard(monkeypatch, tmp_path):
+    clear_env(monkeypatch)
+    monkeypatch.setenv("TERM_PROGRAM", "ghostty")
+    monkeypatch.setattr(channels.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(channels, "_mac_terminal_tty", lambda: "ttys123")
+    monkeypatch.setattr(channels.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(channels, "_write_tty", lambda data, tty, log: True)
+    monkeypatch.setattr(channels.tempfile, "gettempdir", lambda: str(tmp_path))
+    capture_dir = tmp_path / ("B" * 22)
+    capture_dir.mkdir()
+    stale = capture_dir / "screen.txt"
+    stale.write_text(PROMPT_SCREEN, encoding="utf-8")
+    stale.chmod(0o600)
+    os.utime(stale, (1, 1))
+    os.utime(capture_dir, (1, 1))
+    snapshots = iter(
+        [
+            {"changeCount": "7", "items": [], "text": "old"},
+            {"changeCount": "7", "items": [], "text": str(stale)},
+        ]
+    )
+    monkeypatch.setattr(
+        channels,
+        "_pasteboard_snapshot",
+        lambda log: next(snapshots, {"changeCount": "7", "items": [], "text": str(stale)}),
+    )
+    restored = []
+    monkeypatch.setattr(
+        channels,
+        "_pasteboard_restore",
+        lambda *args, **kwargs: restored.append(args) or True,
+    )
+    fake = FakeRun()
+    fake.always("osascript", stdout=b"ok\n")
+    patch_run(monkeypatch, fake)
+    channel = channels.GhosttyChannel([MARKER])
+    channel.terminal_id = "terminal-uuid"
+
+    assert channel.capture() is None
+    assert not restored
+    assert stale.exists()
+
+
+def test_ghostty_rejects_symlinked_screen_file(monkeypatch, tmp_path):
+    clear_env(monkeypatch)
+    monkeypatch.setenv("TERM_PROGRAM", "ghostty")
+    monkeypatch.setattr(channels.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(channels, "_mac_terminal_tty", lambda: "ttys123")
+    monkeypatch.setattr(channels.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(channels, "_write_tty", lambda data, tty, log: True)
+    monkeypatch.setattr(channels.tempfile, "gettempdir", lambda: str(tmp_path))
+    capture_dir = tmp_path / ("C" * 22)
+    capture_dir.mkdir()
+    target = tmp_path / "outside-screen.txt"
+    target.write_text(PROMPT_SCREEN, encoding="utf-8")
+    os.symlink(target, capture_dir / "screen.txt")
+    snapshots = iter(
+        [
+            {"changeCount": "1", "items": [], "text": "old"},
+            {"changeCount": "2", "items": [], "text": str(capture_dir / "screen.txt")},
+        ]
+    )
+    monkeypatch.setattr(
+        channels,
+        "_pasteboard_snapshot",
+        lambda log: next(
+            snapshots,
+            {"changeCount": "2", "items": [], "text": str(capture_dir / "screen.txt")},
+        ),
+    )
+    monkeypatch.setattr(channels, "_pasteboard_restore", lambda *args, **kwargs: True)
+    fake = FakeRun()
+    fake.always("osascript", stdout=b"ok\n")
+    patch_run(monkeypatch, fake)
+    channel = channels.GhosttyChannel([MARKER])
+    channel.terminal_id = "terminal-uuid"
+
+    assert channel.capture() is None
+    assert (capture_dir / "screen.txt").is_symlink()
+    assert target.exists()
+
+
+def test_ghostty_accepts_canonical_path_for_temp_root_alias(monkeypatch, tmp_path):
+    canonical_root = tmp_path / "canonical-tmp"
+    canonical_root.mkdir()
+    root_alias = tmp_path / "tmp-alias"
+    root_alias.symlink_to(canonical_root, target_is_directory=True)
+    monkeypatch.setattr(channels.tempfile, "gettempdir", lambda: str(root_alias))
+    capture_dir = canonical_root / ("D" * 22)
+    capture_dir.mkdir()
+    screen_path = capture_dir / "screen.txt"
+    screen_path.write_text(PROMPT_SCREEN, encoding="utf-8")
+    screen_path.chmod(0o600)
+
+    assert channels._ghostty_screen_path(str(screen_path), 0) == str(screen_path)
+
+
+def test_ghostty_missing_terminal_context_does_not_run_commands(monkeypatch):
+    clear_env(monkeypatch)
+    monkeypatch.setattr(channels.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(channels.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(channels, "_mac_terminal_tty", lambda: "")
+    assert channels.GhosttyChannel.available() is False
 
 
 # --- failures, timeouts, and the no-raise rule -------------------------------

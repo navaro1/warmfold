@@ -1,5 +1,9 @@
 ---
-description: Show warmfold savings: today, last 7 days, all time, across sessions (local, no API call)
+description: Show warmfold savings: today, last 7 days, all time, across sessions
 ---
 
-warmfold intercepts this command locally. If you see this text, the plugin hook did not run. Tell the user to check hooks with /hooks.
+Display the savings report supplied by the warmfold UserPromptSubmit hook
+exactly as provided. Preserve every line break and character. Do not call
+tools, modify files, or add commentary. If no report was supplied, explain
+that warmfold could not produce a report and suggest checking the hook with
+/hooks.

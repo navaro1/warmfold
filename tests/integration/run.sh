@@ -5,15 +5,14 @@
 #   run.sh <case>          run one case
 #   run.sh all             run every case in sequence
 #
-# Cases: compact-tmux handoff-plain guard-cold clear-loads-handoff
-#        status-local savings zellij
+# Cases: compact-tmux guard-cold status-local savings zellij
 #
 # Each case starts a real claude in a tmux pane (or a zellij pane for the
 # zellij case), sends real prompts, and asserts the watcher behavior in the
-# state files, the handoff files, the transcript, and the pane screen.
+# state files, the transcript, and the pane screen.
 # Every case gets its own data directory under $ART/cases/<case>/data.
 #
-# Requirements: bash 4+, tmux, python3, and the claude CLI on PATH.
+# Requirements: bash 3.2+, tmux, python3, and the claude CLI on PATH.
 # See README.md for the environment overrides and the artifact layout.
 set -u
 
@@ -23,7 +22,7 @@ source "$HERE/lib.sh"
 
 usage() {
   log "usage: run.sh <case>"
-  log "cases: compact-tmux handoff-plain guard-cold clear-loads-handoff status-local savings zellij all"
+  log "cases: compact-tmux guard-cold status-local savings zellij all"
 }
 
 # prime_session <session>: accept the trust dialog, then run two turns so the
@@ -126,46 +125,10 @@ case_compact_tmux() {
   end_case
 }
 
-case_handoff_plain() {
-  begin_case handoff-plain
-  build_pane_args none
-  if ! start_claude "ccit-${RUN_ID}-handoff" "$CASE_DIR/cwd"; then
-    check "claude session started" 1 "tmux new-session failed"
-    end_case
-    return 0
-  fi
-  prime_or_fail "$CURRENT_SESSION" "claude accepted trust and finished two turns" || return 0
-  # The handoff must complete within IDLE_TIMEOUT of the confirmed turn end;
-  # read state first, then the file (the writer finishes before handoff_done).
-  if wait_for_state_phase handoff_done "$((IDLE_TIMEOUT + 60))"; then
-    check "state phase handoff_done within deadline" 0
-  else
-    check "state phase handoff_done within deadline" 1 \
-      "state: $(clip "$(cat "$(state_file)" 2>/dev/null)")"
-    end_case
-    return 0
-  fi
-  local hf
-  if hf="$(wait_for_handoff 30)"; then
-    check "handoff file exists in this case handoff tree" 0 "$hf"
-  else
-    check "handoff file exists in this case handoff tree" 1 \
-      "tree: $CASE_DIR/data/handoffs"
-    end_case
-    return 0
-  fi
-  if handoff_has_headings "$hf"; then
-    check "handoff has all seven headings in order" 0
-  else
-    check "handoff has all seven headings in order" 1 "file: $hf"
-  fi
-  assert_state_channel none
-  end_case
-}
-
 case_guard_cold() {
   begin_case guard-cold
-  # FORCE_TTL_SECONDS=30 sends the watcher to phase cold; no handoff runs.
+  # FORCE_TTL_SECONDS=30 makes the watcher defer before cache expiry; the
+  # watcher exits after recording compact_deferred.
   # The guard blocks one submit, then lets the resent prompt through the
   # ack window (DESIGN.md section 6, return guard).
   build_pane_args none "WARMFOLD_GUARD=1" "WARMFOLD_GUARD_MIN_USD=0.0001" \
@@ -176,16 +139,14 @@ case_guard_cold() {
     return 0
   fi
   prime_or_fail "$CURRENT_SESSION" "claude accepted trust and finished two turns" || return 0
-  # With FORCE_TTL_SECONDS=30 the deadline is start + 30 - min(margin, 6) s,
-  # so the watcher hands off within seconds (the correct pre-expiry action).
-  # The handoff turn refreshes the cache once more. The guard blocks only after
-  # the real expiry: last request start + 30 s. Wait for the handoff, then
-  # for the expiry, then type.
-  if wait_for_state_phase handoff_done 120; then
-    check "watcher handed off before the forced expiry" 0
+  # With FORCE_TTL_SECONDS=30 the action deadline is start + 30 - min(margin,
+  # 6 s). The watcher defers and exits. Wait for that state, then wait 60 s
+  # from the latest turn so last_request_start + TTL is safely in the past.
+  if wait_for_state_phase compact_deferred 120; then
+    check "watcher deferred without fallback injection" 0
     sleep 60
   else
-    check "watcher handed off before the forced expiry" 1 \
+    check "watcher deferred without fallback injection" 1 \
       "state: $(clip "$(cat "$(state_file)" 2>/dev/null)")"
     end_case
     return 0
@@ -236,62 +197,6 @@ case_guard_cold() {
   end_case
 }
 
-case_clear_loads_handoff() {
-  begin_case clear-loads-handoff
-  build_pane_args none
-  if ! start_claude "ccit-${RUN_ID}-clear" "$CASE_DIR/cwd"; then
-    check "claude session started" 1 "tmux new-session failed"
-    end_case
-    return 0
-  fi
-  prime_or_fail "$CURRENT_SESSION" "claude accepted trust and finished two turns" || return 0
-  if ! wait_for_state_phase handoff_done "$((IDLE_TIMEOUT + 60))"; then
-    check "state phase handoff_done before /clear" 1 \
-      "state: $(clip "$(cat "$(state_file)" 2>/dev/null)")"
-    end_case
-    return 0
-  fi
-  local latest clear_epoch consumed
-  latest="$(latest_json)"
-  if [ -z "$latest" ]; then
-    check "latest.json exists after the handoff" 1 "tree: $CASE_DIR/data/handoffs"
-    end_case
-    return 0
-  fi
-  # /clear must consume the handoff: consumed_at turns positive and lands
-  # after the /clear submission time.
-  clear_epoch="$(date +%s)"
-  send_prompt "$CURRENT_SESSION" "/clear"
-  if consumed="$(wait_for_consumed_at "$latest" "$clear_epoch" 90)"; then
-    check "consumed_at set after the /clear submission" 0 "consumed_at: $consumed"
-  else
-    check "consumed_at set after the /clear submission" 1 "file: $latest"
-  fi
-  if latest_json_valid "$latest"; then
-    check "latest.json holds cwd session_id saved_at path" 0
-  else
-    check "latest.json holds cwd session_id saved_at path" 1 "file: $latest"
-  fi
-  send_prompt "$CURRENT_SESSION" "$PROMPT_HANDOFF_Q"
-  if wait_for_turn_end "$CURRENT_SESSION" "$TURN_TIMEOUT"; then
-    check "post-clear question finished a turn" 0
-  else
-    save_screen "$CURRENT_SESSION" "clear-question" >/dev/null
-    check "post-clear question finished a turn" 1
-    end_case
-    return 0
-  fi
-  local t
-  t="$(latest_transcript "$CURRENT_CWD")"
-  if [ -n "$t" ] && transcript_assistant_contains_after "$t" "$PROMPT_OFFSET" "$CASE_STORY_WORD"; then
-    check "answer quotes the story identifier from the handoff" 0 "identifier: $CASE_STORY_WORD"
-  else
-    check "answer quotes the story identifier from the handoff" 1 \
-      "identifier: $CASE_STORY_WORD transcript: $t offset: $PROMPT_OFFSET"
-  fi
-  end_case
-}
-
 case_status_local() {
   begin_case status-local
   build_pane_args tmux "WARMFOLD_FORCE_TTL_SECONDS=3600"
@@ -327,10 +232,10 @@ case_status_local() {
   done
   local t
   t="$(latest_transcript "$CURRENT_CWD")"
-  if [ -n "$t" ] && transcript_has_no_records_after "$t" "$PROMPT_OFFSET"; then
-    check "status command added no user or assistant record" 0
+  if [ -n "$t" ] && transcript_turn_after "$t" "$PROMPT_OFFSET"; then
+    check "status command completed a normal assistant turn" 0
   else
-    check "status command added no user or assistant record" 1 \
+    check "status command completed a normal assistant turn" 1 \
       "transcript: $t offset: $PROMPT_OFFSET"
   fi
   end_case
@@ -374,10 +279,10 @@ case_savings() {
   done
   local t
   t="$(latest_transcript "$CURRENT_CWD")"
-  if [ -n "$t" ] && transcript_has_no_records_after "$t" "$PROMPT_OFFSET"; then
-    check "savings command added no user or assistant record" 0
+  if [ -n "$t" ] && transcript_turn_after "$t" "$PROMPT_OFFSET"; then
+    check "savings command completed a normal assistant turn" 0
   else
-    check "savings command added no user or assistant record" 1 \
+    check "savings command completed a normal assistant turn" 1 \
       "transcript: $t offset: $PROMPT_OFFSET"
   fi
   # The first user return after the action lands long before cold_at
@@ -443,17 +348,13 @@ main() {
   trap 'exit 143' TERM
   case "$1" in
     compact-tmux) case_compact_tmux ;;
-    handoff-plain) case_handoff_plain ;;
     guard-cold) case_guard_cold ;;
-    clear-loads-handoff) case_clear_loads_handoff ;;
     status-local) case_status_local ;;
     savings) case_savings ;;
     zellij) case_zellij ;;
     all)
       case_compact_tmux
-      case_handoff_plain
       case_guard_cold
-      case_clear_loads_handoff
       case_status_local
       case_savings
       case_zellij

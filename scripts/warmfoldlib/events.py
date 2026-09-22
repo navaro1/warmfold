@@ -4,15 +4,13 @@ Each handler takes ``(payload, cfg)`` and returns ``(output, exit_code)``.
 ``output`` is None, a dict (printed as one JSON object on stdout), or a
 plain string (printed verbatim; manual ``status`` only). Handlers never
 raise: the CLI wrapper catches everything, logs it, and exits 0. Exit code
-2 is reserved for the deliberate wake (handoff, keep-alive).
+2 is reserved for the deliberate keep-alive wake.
 
 ``now()`` and ``sleep()`` are module-level so tests can monkeypatch them
 and drive the watcher loop without real time.
 """
 
 import contextlib
-import hashlib
-import json
 import os
 import sys
 import time
@@ -34,23 +32,13 @@ LOOP_MAX_ITERATIONS = 200000
 STATUS_COMMAND = "/warmfold:status"
 SAVINGS_COMMAND = "/warmfold:savings"
 
-HANDOFF_REMINDER = (
-    "warmfold: the user has been idle for {idle_min} minutes. "
-    "The prompt cache expires in {left_min} minutes. Context is {tokens} tokens.\n"
-    "Write a handoff summary for a fresh session. Use these headings: Goal, "
-    "Current state, Decisions made, Open tasks, Key files and paths, Next step, "
-    "Things to avoid.\n"
-    "Rules: plain text under 1500 words, no tool calls, no questions, no "
-    "preamble. Start with the first heading. Stop after the last section.\n"
-)
-
 KEEPALIVE_REMINDER = "warmfold keep-alive. Reply with exactly: ok\n"
 
 GUARD_MESSAGE = (
     "warmfold: the prompt cache is cold.\n"
     "Idle for {idle_min} minutes. Context is {tokens} tokens on {model}.\n"
     "The next request pays about {usd} USD to rebuild the cache.\n"
-    "{hint}Resend to continue at full cost."
+    "Resend to continue at full cost."
 )
 
 
@@ -109,119 +97,100 @@ def _utc_iso(epoch):
         return "unknown"
 
 
-def _detect_channel(cfg, data_dir=None):
+class _T3Channel:
+    """Adapter that keeps T3 dispatch outcomes distinct from keystrokes."""
+
+    name = "t3"
+
+    def __init__(self, session_id, cwd, cfg, log_fn=None):
+        self.session_id = session_id
+        self.cwd = cwd
+        self.cfg = cfg
+        self.log_fn = log_fn
+        self.outcome = None
+        self.reason = ""
+
+    def inject_compact(self):
+        try:
+            from . import t3
+
+            result = t3.request_compact(
+                self.session_id,
+                self.cwd,
+                self.cfg,
+                log=self.log_fn,
+            )
+            self.outcome = result.status
+            self.reason = result.reason
+            return result.accepted
+        except Exception as exc:
+            self.outcome = "rejected"
+            self.reason = "T3 dispatch failed"
+            if self.log_fn:
+                try:
+                    self.log_fn("t3: dispatch failed: %s" % type(exc).__name__)
+                except Exception:
+                    pass
+            return False
+
+
+def _detect_channel(cfg, data_dir=None, payload=None):
     """Return a verified channel or None.
 
     WP2 provides warmfoldlib.channels; until it exists (or when detection
-    fails) there is no channel and the handlers degrade to handoff mode.
+    fails) there is no channel and the handlers safely defer the action.
     """
     if (cfg.get("force_channel") or "") == "none":
-        return None
-    try:
-        from . import channels
-    except ImportError:
         return None
     sink = None
     if data_dir:
         sink = lambda msg: log.append(data_dir, "channel", str(msg))  # noqa: E731
-    try:
-        return channels.detect(cfg, log=sink)
-    except Exception:
+    force = str(cfg.get("force_channel") or "").strip().lower()
+    if force != "t3":
+        try:
+            from . import channels
+
+            channel = channels.detect(cfg, log=sink)
+            if channel is not None:
+                return channel
+        except Exception:
+            pass
+    if force not in ("", "t3"):
         return None
+    payload = payload or {}
+    session_id = str(payload.get("session_id") or "").strip()
+    cwd = str(payload.get("cwd") or "").strip()
+    if not session_id or not cwd:
+        return None
+    try:
+        from . import t3
+
+        result = t3.resolve_target(
+            session_id,
+            cwd,
+            _t3_db_path(cfg),
+        )
+        if result.accepted:
+            return _T3Channel(session_id, cwd, cfg, sink)
+        if sink:
+            sink("t3: skipped; %s" % result.reason)
+    except Exception:
+        pass
+    return None
 
 
-def _resolve_mode(cfg):
+def _t3_db_path(cfg):
+    value = str(cfg.get("t3_db_path") or "").strip()
+    return value or None
+
+
+def _resolve_mode(cfg, payload=None):
     mode = cfg.get("mode") or "auto"
     if mode == "auto":
-        channel = _detect_channel(cfg, cfg.get("data_dir"))
-        return "compact" if channel is not None else "handoff"
+        return "compact"
+    if mode == "handoff":
+        return "compact"
     return mode
-
-
-# ---------------------------------------------------------------------------
-# handoff files
-
-
-def _handoff_dir(cfg, cwd):
-    digest = hashlib.sha1(str(cwd or "unknown").encode("utf-8")).hexdigest()[:12]
-    return os.path.join(cfg["data_dir"], "handoffs", digest)
-
-
-def save_handoff(cfg, session_id, cwd, text, when=None, action_id=None):
-    """Write the handoff markdown and the per-cwd latest.json pointer.
-
-    ``action_id`` is the savings ledger action this handoff settles; the
-    session-start consumption uses it to find the exact action.
-    """
-    moment = now() if when is None else when
-    directory = _handoff_dir(cfg, cwd)
-    os.makedirs(directory, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(moment))
-    name = "%s-%s.md" % (stamp, state._safe_id(session_id))
-    path = os.path.join(directory, name)
-    body = text if text.endswith("\n") else text + "\n"
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(body)
-    latest = {
-        "path": path,
-        "session_id": session_id,
-        "cwd": cwd,
-        "saved_at": moment,
-        "consumed_at": None,
-        "action_id": action_id,
-    }
-    state.write_json_atomic(os.path.join(directory, "latest.json"), latest)
-    return path
-
-
-def _pending_handoff_action_id(data_dir, session_id):
-    """This session's newest pending handoff action id, or None."""
-    try:
-        pending = ledger.pending_actions(
-            ledger.load(data_dir), session_id, action="handoff"
-        )
-    except Exception:
-        return None
-    return pending[-1].get("id") if pending else None
-
-
-def load_latest_handoff(cfg, cwd):
-    """Return the latest.json dict for this cwd, or None."""
-    path = os.path.join(_handoff_dir(cfg, cwd), "latest.json")
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            latest = json.load(handle)
-    except (OSError, ValueError):
-        return None
-    return latest if isinstance(latest, dict) else None
-
-
-def _handoff_fresh(latest, cfg):
-    saved = latest.get("saved_at")
-    try:
-        saved = float(saved)
-    except (TypeError, ValueError):
-        return False
-    max_age = _num(cfg, "handoff_max_age_hours", 24.0) * 3600.0
-    return (now() - saved) <= max_age
-
-
-def _mark_consumed(cfg, cwd, latest):
-    latest["consumed_at"] = now()
-    try:
-        state.write_json_atomic(
-            os.path.join(_handoff_dir(cfg, cwd), "latest.json"), latest
-        )
-    except OSError:
-        pass
-
-
-def _read_handoff_text(path):
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return handle.read()
-    except OSError:
-        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +258,7 @@ def _outcome_rules(act, info, cfg, payload, t_now):
 
     The rebuild term uses the current context's cold time: the
     transcript's newest request start plus the TTL. A compact summary
-    request and the handoff turn both refresh it, so a still-warm
+    request and the native compaction turn both refresh it, so a still-warm
     compacted context pays no rebuild. Missing transcript data assumes a
     zero rebuild and marks the outcome with an estimate note.
     """
@@ -316,7 +285,7 @@ def _settle_outcomes(data_dir, cfg, session_id, payload, st, t_now,
     """Write one outcome per pending action of this session.
 
     A blocked submit above is not a user return, so this runs only on a
-    prompt that passes. A guard pass on a handoff is paid_cold: the user
+    prompt that passes. A guard pass on a legacy action is paid_cold: the user
     continued on the old context and will pay the rebuild.
 
     The ledger lock is held across the pending check and the appends, so
@@ -364,54 +333,6 @@ def _settle_outcomes(data_dir, cfg, session_id, payload, st, t_now,
             )
 
 
-def _settle_consumed(cfg, data_dir, latest, t_now):
-    """Settle the handoff action that a /clear just consumed.
-
-    Returns True when the outcome is on the ledger, or nothing was
-    pending (already settled, or the action was never recorded). Raises
-    on a write failure, so the caller can leave the handoff unconsumed
-    and retry on the next clear.
-    """
-    session_id = latest.get("session_id")
-    if not session_id:
-        return True
-    with ledger.locked(data_dir):
-        pending = ledger.pending_actions(
-            ledger.read_records(data_dir), session_id, action="handoff"
-        )
-        act = None
-        want = latest.get("action_id")
-        for cand in pending:
-            if cand.get("id") == want:
-                act = cand
-                break
-        if act is None:
-            act = pending[-1] if pending else None
-        if act is None:
-            return True
-        if t_now > _f(act.get("cold_at")):
-            # The old context is cleared away, so nothing is rebuilt.
-            outcome, saved = "realized", _f(act.get("avoid_usd")) - _f(
-                act.get("paid_usd")
-            )
-        else:
-            outcome, saved = "early", -_f(act.get("paid_usd"))
-        ledger.append_record(
-            data_dir,
-            ledger.outcome_record(
-                ref=act.get("id"),
-                session_id=session_id,
-                outcome=outcome,
-                saved_usd=saved,
-                ts=t_now,
-            ),
-        )
-        log.append(
-            data_dir, "session-start", "ledger outcome=%s saved=%.2f" % (outcome, saved)
-        )
-        return True
-
-
 def watch(payload, cfg):
     data_dir = cfg["data_dir"]
     session_id = payload.get("session_id") or "unknown"
@@ -421,31 +342,7 @@ def watch(payload, cfg):
     with _session_lock(data_dir, session_id):
         st = state.load(data_dir, session_id)
 
-        # 1. A pending handoff plus a non-empty reply: save it, do not arm.
-        #    handoff_done only after both files exist; a failure keeps the
-        #    pending phase so the next Stop can retry.
-        last_msg = str(payload.get("last_assistant_message") or "")
-        if st.get("phase") == "handoff_pending" and last_msg.strip():
-            cwd = st.get("cwd") or payload.get("cwd") or ""
-            try:
-                action_id = _pending_handoff_action_id(data_dir, session_id)
-                path = save_handoff(
-                    cfg, session_id, cwd, last_msg, action_id=action_id
-                )
-                latest = os.path.join(_handoff_dir(cfg, cwd), "latest.json")
-                if os.path.exists(path) and os.path.exists(latest):
-                    st["phase"] = "handoff_done"
-                    state.save(data_dir, session_id, st)
-                    log.append(data_dir, "watch", "handoff saved: %s" % path)
-                else:
-                    raise OSError("handoff files missing after save")
-            except OSError as exc:
-                st["phase"] = "handoff_pending"
-                state.save(data_dir, session_id, st)
-                log.append(data_dir, "watch", "handoff save failed: %r" % (exc,))
-            return (None, 0)
-
-        # 2. A keep-alive wake returns here; count it and arm again.
+        # A keep-alive wake returns here; count it and arm again.
         resumed_keepalive = False
         if st.get("phase") == "keepalive_pending":
             st["phase"] = "idle"
@@ -460,7 +357,7 @@ def watch(payload, cfg):
             acted = (st.get("last_compact_at") or 0.0) > activity or (
                 st.get("last_action_at") or 0.0
             ) > activity
-            if acted or st.get("phase") == "handoff_done":
+            if acted:
                 log.append(
                     data_dir,
                     "watch",
@@ -469,7 +366,12 @@ def watch(payload, cfg):
                 return (None, 0)
 
         # 4. Arm.
-        channel = _detect_channel(cfg, cfg.get("data_dir"))
+        channel_payload = dict(payload)
+        if not channel_payload.get("session_id"):
+            channel_payload["session_id"] = session_id
+        if not channel_payload.get("cwd"):
+            channel_payload["cwd"] = st.get("cwd") or ""
+        channel = _detect_channel(cfg, cfg.get("data_dir"), channel_payload)
         st["armed_token"] = my_token
         st["phase"] = "idle"
         st["channel"] = channel.name if channel is not None else "none"
@@ -563,7 +465,12 @@ def watch(payload, cfg):
         if not due:
             continue
 
-        mode = _resolve_mode(cfg)
+        channel_payload = dict(payload)
+        if not channel_payload.get("session_id"):
+            channel_payload["session_id"] = session_id
+        if not channel_payload.get("cwd"):
+            channel_payload["cwd"] = cur.get("cwd") or st.get("cwd") or ""
+        mode = _resolve_mode(cfg, channel_payload)
         if mode == "warn":
             return (None, 0)
 
@@ -603,12 +510,13 @@ def watch(payload, cfg):
                         "phase=keepalive_pending wake=%d" % wakes,
                     )
                     return (None, 2)
-                log.append(data_dir, "watch", "keepalive budget spent; handoff")
-                mode = "handoff"
+                log.append(data_dir, "watch", "keepalive budget spent; attempting compact")
+                mode = "compact"
 
             if mode == "compact":
                 ok = False
-                channel = _detect_channel(cfg, cfg.get("data_dir"))
+                channel = _detect_channel(cfg, cfg.get("data_dir"), channel_payload)
+                previous_last_action = cur.get("last_action_at") or 0.0
                 if channel is not None:
                     # Stamp before the injection: sending the keystrokes is
                     # the action, even when the channel reports failure.
@@ -632,31 +540,25 @@ def watch(payload, cfg):
                         )
                     log.append(data_dir, "watch", "phase=compact_sent")
                     return (None, 0)
-                log.append(data_dir, "watch", "compact failed; fall back to handoff")
-                mode = "handoff"
-
-            # handoff
-            cur["phase"] = "handoff_pending"
-            cur["last_action_at"] = t_now
-            state.save(data_dir, session_id, cur)
-            try:
-                _ledger_action(
-                    data_dir, session_id, cur, payload, info, ttl,
-                    cold_at, t_now, "handoff"
-                )
-            except Exception as exc:
-                log.append(
-                    data_dir, "watch", "ledger action failed: %r" % (exc,)
-                )
-            sys.stderr.write(
-                HANDOFF_REMINDER.format(
-                    idle_min=int(max(0.0, idle) // 60),
-                    left_min=max(0, int((deadline - t_now) // 60)),
-                    tokens=info.context_tokens,
-                )
-            )
-            log.append(data_dir, "watch", "phase=handoff_pending")
-            return (None, 2)
+                outcome = getattr(channel, "outcome", "") if channel is not None else ""
+                if outcome in ("uncertain", "deferred"):
+                    cur["phase"] = (
+                        "compact_pending" if outcome == "uncertain" else "compact_deferred"
+                    )
+                    if outcome == "deferred":
+                        cur["last_action_at"] = previous_last_action
+                    state.save(data_dir, session_id, cur)
+                    log.append(
+                        data_dir,
+                        "watch",
+                        "compact outcome %s; no fallback" % outcome,
+                    )
+                    return (None, 0)
+                log.append(data_dir, "watch", "compact unavailable or failed; action deferred")
+                cur["phase"] = "compact_deferred"
+                cur["last_action_at"] = previous_last_action
+                state.save(data_dir, session_id, cur)
+                return (None, 0)
 
     log.append(data_dir, "watch", "exit: iteration cap reached")
     return (None, 0)
@@ -670,37 +572,23 @@ def prompt(payload, cfg):
     data_dir = cfg["data_dir"]
     session_id = payload.get("session_id") or "unknown"
     text = str(payload.get("prompt") or "")
-
-    # 1. Local commands: zero tokens, the prompt is erased, no state change.
     text = text.strip()
-    if text.startswith((STATUS_COMMAND, SAVINGS_COMMAND)):
-        try:
-            if text.startswith(SAVINGS_COMMAND):
-                report = _savings_report(cfg, session_id)
-                log.append(data_dir, "prompt", "savings intercepted")
-            else:
-                report = status_report(payload, cfg)
-                log.append(data_dir, "prompt", "status intercepted")
-        except Exception as exc:
-            # The local command must always block: a broken report must
-            # never let the prompt reach the model.
-            report = "warmfold: report failed: %s" % (exc,)
-            log.append(data_dir, "prompt", "report failed: %r" % (exc,))
-        return (
-            {"decision": "block", "reason": report, "suppressOriginalPrompt": True},
-            0,
-        )
+    report_command = text if text in (STATUS_COMMAND, SAVINGS_COMMAND) else None
 
-    # 2. Record activity and reset post-action phases.
+    # 1. Every accepted prompt, including report commands, records activity,
+    #    applies the configured guard, and settles the first return after a
+    #    pending action. The report is computed only after this bookkeeping
+    #    so /warmfold:savings includes the outcome from this turn.
     t_now = now()
     guard_passed = False
     with _session_lock(data_dir, session_id):
         st = state.load(data_dir, session_id)
         st["activity_at"] = t_now
         if st.get("phase") in (
-            "handoff_done",
             "keepalive_pending",
             "compact_sent",
+            "compact_pending",
+            "compact_deferred",
             "cold",
             "done",
         ):
@@ -718,8 +606,8 @@ def prompt(payload, cfg):
         )
         return ({"decision": "block", "reason": reason, "suppressOriginalPrompt": False}, 0)
 
-    # 4. The submit passed, so it is the first user return after any
-    #    pending action: settle its savings outcome.
+    # 4. The submit passed, so it is the first user return after any pending
+    #    action: settle its savings outcome before building a report.
     try:
         _settle_outcomes(data_dir, cfg, session_id, payload, st, t_now,
                          guard_passed)
@@ -728,7 +616,48 @@ def prompt(payload, cfg):
             log.append(data_dir, "prompt", "ledger outcome failed: %r" % (exc,))
         except Exception:
             pass
+
+    if report_command is not None:
+        try:
+            if report_command == SAVINGS_COMMAND:
+                report = _savings_report(cfg, session_id)
+                log.append(data_dir, "prompt", "savings context added")
+            else:
+                report = status_report(payload, cfg)
+                log.append(data_dir, "prompt", "status context added")
+        except Exception as exc:
+            report = "warmfold: report failed: %s" % (exc,)
+            log.append(data_dir, "prompt", "report failed: %r" % (exc,))
+        return (
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": _report_context(report_command, report),
+                }
+            },
+            0,
+        )
     return (None, 0)
+
+
+def _report_context(command, report):
+    """Give Claude a report and an exact rendering instruction.
+
+    UserPromptSubmit hooks cannot write an assistant message themselves.
+    Suppressing the command with ``decision=block`` makes Claude Code show a
+    hook error, so the report travels as additional context and the command
+    markdown asks the normal response path to print it verbatim.
+    """
+    label = "status" if command == STATUS_COMMAND else "savings"
+    return (
+        "warmfold {label} report (computed locally):\n"
+        "<warmfold-report>\n"
+        "{report}\n"
+        "</warmfold-report>\n\n"
+        "The slash command instruction asks you to display this report. "
+        "Output only the text between the report tags, preserving its line "
+        "breaks exactly. Do not call tools, modify files, or add commentary."
+    ).format(label=label, report=report.rstrip("\n"))
 
 
 def _guard_reason(payload, cfg, st, t_now):
@@ -764,18 +693,10 @@ def _guard_reason(payload, cfg, st, t_now):
     st["guard_ack_until"] = t_now + _num(cfg, "guard_ack_seconds", 120.0)
 
     idle_min = int(max(0.0, t_now - info.last_request_start) // 60)
-    hint = ""
-    cwd = payload.get("cwd") or st.get("cwd") or ""
-    latest = load_latest_handoff(cfg, cwd) if cwd else None
-    if latest and latest.get("path") and _handoff_fresh(latest, cfg):
-        hint = (
-            "A handoff from %s exists at %s. Start a fresh session and read "
-            "it there to skip the rebuild.\n"
-        ) % (_local_hm(latest.get("saved_at") or 0), latest.get("path"))
     model = info.model or "unknown model"
     return (
         GUARD_MESSAGE.format(
-            idle_min=idle_min, tokens=ctx, model=model, usd="%.2f" % usd, hint=hint
+            idle_min=idle_min, tokens=ctx, model=model, usd="%.2f" % usd
         ),
         False,
     )
@@ -807,67 +728,9 @@ def session_start(payload, cfg):
         state.save(data_dir, session_id, st)
     log.append(data_dir, "session-start", "source=%s" % source)
 
-    autoload = cfg.get("handoff_autoload") or "clear"
-    if autoload == "off":
-        return (None, 0)
-    if source not in ("clear", "startup"):
-        return (None, 0)
-    cwd = payload.get("cwd") or st.get("cwd") or ""
-    if not cwd:
-        return (None, 0)
-    latest = load_latest_handoff(cfg, cwd)
-    if not latest or not latest.get("path") or not _handoff_fresh(latest, cfg):
-        return (None, 0)
-    when = _local_hm(latest.get("saved_at") or 0)
-
-    if source == "startup" and autoload == "clear":
-        # Pointer only: the user decides; the full load happens on /clear.
-        line = (
-            "A warmfold handoff from %s exists at %s. "
-            "Read it only if the user continues that work." % (when, latest["path"])
-        )
-        log.append(data_dir, "session-start", "handoff pointer shown")
-        return (
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "SessionStart",
-                    "additionalContext": line,
-                },
-                "systemMessage": "warmfold: handoff exists from %s" % when,
-            },
-            0,
-        )
-
-    if latest.get("consumed_at"):
-        return (None, 0)
-    content = _read_handoff_text(latest["path"])
-    if not content.strip():
-        return (None, 0)
-    header = "warmfold: handoff saved at %s (session %s).\n\n" % (
-        when,
-        latest.get("session_id") or "unknown",
-    )
-    # Settle the outcome before marking the handoff consumed: a failed
-    # append must not leave a consumed handoff with a pending action. The
-    # next clear retries both steps.
-    settled = False
-    try:
-        settled = _settle_consumed(cfg, data_dir, latest, now())
-    except Exception as exc:
-        log.append(data_dir, "session-start", "ledger outcome failed: %r" % (exc,))
-    if settled:
-        _mark_consumed(cfg, cwd, latest)
-    log.append(data_dir, "session-start", "handoff injected: %s" % latest["path"])
-    return (
-        {
-            "hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "additionalContext": header + content,
-            },
-            "systemMessage": "warmfold: loaded handoff from %s" % when,
-        },
-        0,
-    )
+    # SessionStart only resets watcher state. Legacy files remain untouched
+    # and are never read or injected.
+    return (None, 0)
 
 
 def session_end(payload, cfg):
@@ -941,12 +804,14 @@ def status(payload, cfg):
     return (status_report(payload, cfg), 0)
 
 
-def _next_action_text(cfg, st, info, ttl, t_now):
+def _next_action_text(cfg, st, info, ttl, t_now, payload=None):
     phase = st.get("phase") or "idle"
-    if phase == "handoff_pending":
-        return "waiting for the handoff summary"
     if phase == "compact_sent":
         return "waiting for the compaction to finish"
+    if phase == "compact_pending":
+        return "waiting for an uncertain native compaction result"
+    if phase == "compact_deferred":
+        return "compaction deferred until the native terminal is idle"
     if phase == "keepalive_pending":
         return "waiting for the keep-alive reply"
     if phase == "done":
@@ -970,14 +835,13 @@ def _next_action_text(cfg, st, info, ttl, t_now):
     )
     if due_at <= t_now:
         return "due now"
-    return "%s about %s" % (_action_noun(cfg), _local_hm(due_at))
+    return "%s about %s" % (_action_noun(cfg, payload), _local_hm(due_at))
 
 
-def _action_noun(cfg):
-    mode = _resolve_mode(cfg)
+def _action_noun(cfg, payload=None):
+    mode = _resolve_mode(cfg, payload)
     return {
         "compact": "compaction",
-        "handoff": "handoff",
         "keepalive": "keep-alive wake",
         "warn": "warning",
     }.get(mode, mode)
@@ -1034,18 +898,18 @@ def status_report(payload, cfg):
     else:
         lines.append("Idle: unknown")
 
-    channel = _detect_channel(cfg, cfg.get("data_dir"))
+    channel = _detect_channel(cfg, cfg.get("data_dir"), payload)
     lines.append("Channel: %s" % ("none" if channel is None else channel.name))
 
     mode = cfg.get("mode") or "auto"
     if mode == "auto":
-        resolved = "compact" if channel is not None else "handoff"
+        resolved = "compact"
         lines.append("Mode: auto (resolves to %s)" % resolved)
     else:
         lines.append("Mode: %s" % mode)
 
     lines.append(
-        "Next action: %s" % _next_action_text(cfg, st, info, ttl, t_now)
+        "Next action: %s" % _next_action_text(cfg, st, info, ttl, t_now, payload)
     )
 
     if ctx and model:
@@ -1060,8 +924,6 @@ def status_report(payload, cfg):
         lines.append("Cold return cost: unknown")
         lines.append("Warm compaction cost: unknown")
 
-    latest = load_latest_handoff(cfg, cwd) if cwd else None
-    lines.append("Handoff: %s" % (latest.get("path") if latest else "none"))
     return "\n".join(lines)
 
 

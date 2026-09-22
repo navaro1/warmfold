@@ -4,7 +4,7 @@
 Usage: python3 warmfold.py <event>
 
 Events: watch, prompt, session-start, session-end, notification,
-pre-compact, post-compact, stop-failure, status, savings.
+pre-compact, post-compact, stop-failure, status, savings, t3-setup, t3-status.
 
 The hook payload arrives as JSON on stdin (it may be empty for a manual
 ``status`` or ``savings`` run). Hook stdout is either empty, one JSON
@@ -25,11 +25,12 @@ if _HERE not in sys.path:
 from warmfoldlib import config  # noqa: E402
 from warmfoldlib import events  # noqa: E402
 from warmfoldlib import log  # noqa: E402
+from warmfoldlib import t3_auth  # noqa: E402
 
 USAGE = (
     "usage: warmfold.py <event>\n"
     "events: watch, prompt, session-start, session-end, notification, "
-    "pre-compact, post-compact, stop-failure, status, savings\n"
+    "pre-compact, post-compact, stop-failure, status, savings, t3-setup, t3-status\n"
 )
 
 
@@ -49,7 +50,7 @@ def _read_payload(stream):
 
 def _run(event, payload):
     handler = EVENTS.get(event)
-    if handler is None:
+    if handler is None and event not in ("t3-setup", "t3-status"):
         sys.stderr.write("warmfold: unknown event %r\n%s" % (event, USAGE))
         return 0
     try:
@@ -57,14 +58,26 @@ def _run(event, payload):
     except Exception:
         cfg = dict(config.DEFAULTS)
         cfg["data_dir"] = config.default_data_dir()
-    try:
-        output, code = handler(payload, cfg)
-    except Exception as exc:
+    if event == "t3-setup":
         try:
-            log.append(cfg["data_dir"], event, "handler error: %r" % (exc,))
-        except Exception:
-            pass
-        return 0
+            report = t3_auth.setup_report(cfg)
+            output, code = report, 0 if report.get("status") == t3_auth.ACCEPTED else 1
+        except Exception as exc:
+            output, code = {"status": "rejected", "reason": type(exc).__name__}, 1
+    elif event == "t3-status":
+        try:
+            output, code = t3_auth.status_report(cfg), 0
+        except Exception as exc:
+            output, code = {"status": "error", "reason": type(exc).__name__}, 0
+    else:
+        try:
+            output, code = handler(payload, cfg)
+        except Exception as exc:
+            try:
+                log.append(cfg["data_dir"], event, "handler error: %r" % (exc,))
+            except Exception:
+                pass
+            return 0
     try:
         if isinstance(output, dict):
             sys.stdout.write(json.dumps(output) + "\n")
@@ -96,7 +109,10 @@ def main(argv=None):
         sys.stderr.write(USAGE)
         return 0
     event = argv[1]
-    payload = _read_payload(sys.stdin)
+    # Manual T3 enrollment/status are intentionally independent of hook
+    # stdin. A caller may pipe arbitrary data while checking readiness, and
+    # native setup must never treat that data as a hook payload.
+    payload = {} if event in ("t3-setup", "t3-status") else _read_payload(sys.stdin)
     return _run(event, payload)
 
 

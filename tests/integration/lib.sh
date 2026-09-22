@@ -52,7 +52,6 @@ PROMPT1='Say the word ready and stop.'
 # PROMPT2 gains a random identifier word per case; see begin_case.
 PROMPT2=""
 PROMPT_GUARD='Count from 1 to 5, then stop.'
-PROMPT_HANDOFF_Q='what is the handoff goal'
 # PROMPT_RETURN is the first user return after a compaction; with
 # WARMFOLD_FORCE_TTL_SECONDS=3600 it lands long before cold_at, so the
 # ledger outcome is early (DESIGN.md section 12).
@@ -65,8 +64,7 @@ WARMFOLD_KEYS=(
   WARMFOLD_IDLE_MINUTES WARMFOLD_MIN_CONTEXT_TOKENS
   WARMFOLD_SAFETY_MARGIN_MINUTES WARMFOLD_MODE WARMFOLD_KEEPALIVE_HOURS
   WARMFOLD_TTL_5M_POLICY WARMFOLD_GUARD WARMFOLD_GUARD_MIN_USD
-  WARMFOLD_GUARD_ACK_SECONDS WARMFOLD_HANDOFF_AUTOLOAD
-  WARMFOLD_HANDOFF_MAX_AGE_HOURS WARMFOLD_POLL_SECONDS
+  WARMFOLD_GUARD_ACK_SECONDS WARMFOLD_POLL_SECONDS
   WARMFOLD_PANE_MARKERS WARMFOLD_DATA_DIR WARMFOLD_FORCE_TTL_SECONDS
   WARMFOLD_FORCE_CHANNEL
 )
@@ -196,7 +194,13 @@ latest_transcript() { # <cwd> -> newest transcript path, or empty
 }
 
 transcript_size() { # <transcript> -> byte size, 0 when absent
-  stat -c%s "$1" 2>/dev/null || printf '0'
+  # BSD/macOS stat has no GNU -c%s.  Python is already a test requirement
+  # and gives the same byte offset on both platforms.
+  python3 -c 'import os, sys
+try:
+    print(os.path.getsize(sys.argv[1]))
+except OSError:
+    print(0)' "$1" 2>/dev/null || printf '0'
 }
 
 # transcript_turn_after <transcript> <byte-offset>
@@ -676,106 +680,6 @@ zellij_ready() { # <timeout> -> 0 when a zellij action answers for our session
       return 0
     fi
     sleep 1
-  done
-  return 1
-}
-
-# --- handoff helpers ----------------------------------------------------------------
-handoff_key() { # sha1 prefix of the current cwd, layout per DESIGN.md section 4
-  printf '%s' "$CURRENT_CWD" | sha1sum | cut -c1-12
-}
-
-latest_json() { # -> newest latest.json under this case's handoff tree, or empty
-  # shellcheck disable=SC2012  # short fixed names, ls -t is safe here
-  ls -t "$CASE_DIR/data/handoffs"/*/latest.json 2>/dev/null | head -n 1
-}
-
-wait_for_handoff() { # <timeout> -> prints the handoff file path, or returns 1
-  local timeout="$1"
-  local deadline=$(( $(date +%s) + timeout ))
-  local dir f
-  dir="$CASE_DIR/data/handoffs/$(handoff_key)"
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    # shellcheck disable=SC2012
-    f="$(ls -t "$dir"/*.md 2>/dev/null | head -n 1)"
-    if [ -n "$f" ]; then
-      printf '%s\n' "$f"
-      return 0
-    fi
-    # Fallback: any handoff written during this case, in case the key differs.
-    f="$(find "$CASE_DIR/data/handoffs" -name '*.md' -newermt "@$CASE_START" -print 2>/dev/null | head -n 1)"
-    if [ -n "$f" ]; then
-      printf '%s\n' "$f"
-      return 0
-    fi
-    sleep "$POLL"
-  done
-  return 1
-}
-
-# handoff_has_headings <file>
-# 0 when all seven headings from DESIGN.md section 6 appear as heading lines
-# in the required order.
-handoff_has_headings() {
-  python3 -c '
-import sys
-want = ["Goal", "Current state", "Decisions made", "Open tasks",
-        "Key files and paths", "Next step", "Things to avoid"]
-idx = 0
-with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
-    for line in f:
-        s = line.strip().lstrip("#").strip()
-        while s.startswith("*"):
-            s = s[1:].strip()
-        if idx < len(want) and s.lower().startswith(want[idx].lower()):
-            idx += 1
-if idx == len(want):
-    sys.exit(0)
-print("found %d of %d headings" % (idx, len(want)))
-sys.exit(1)
-' "$1"
-}
-
-# latest_json_valid <file>
-# 0 when cwd, session_id, saved_at, and path are all present and non-empty.
-latest_json_valid() {
-  python3 -c '
-import json, sys
-try:
-    with open(sys.argv[1], encoding="utf-8") as f:
-        d = json.load(f)
-except Exception:
-    sys.exit(1)
-for k in ("cwd", "session_id", "saved_at", "path"):
-    if not d.get(k):
-        sys.exit(1)
-sys.exit(0)
-' "$1"
-}
-
-# wait_for_consumed_at <latest.json> <min-epoch> <timeout>
-# Prints consumed_at once it is a number greater than min-epoch.
-wait_for_consumed_at() {
-  local f="$1" min="$2" timeout="$3"
-  local deadline=$(( $(date +%s) + timeout ))
-  local v
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    if [ -f "$f" ]; then
-      v="$(python3 -c '
-import json, sys
-try:
-    with open(sys.argv[1], encoding="utf-8") as f:
-        v = json.load(f).get("consumed_at")
-    v = float(v)
-except Exception:
-    sys.exit(1)
-if v <= float(sys.argv[2]):
-    sys.exit(1)
-print(v)
-' "$f" "$min" 2>/dev/null)"
-      [ -n "$v" ] && { printf '%s\n' "$v"; return 0; }
-    fi
-    sleep "$POLL"
   done
   return 1
 }
