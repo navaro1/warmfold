@@ -10,7 +10,7 @@ the cases.
 
 | Tool | Note |
 |---|---|
-| bash 4 or newer | runs `run.sh` |
+| bash 3.2 or newer | runs `run.sh` (the system Bash on macOS is supported) |
 | tmux | hosts every claude session |
 | zellij 0.45+ | only for the `zellij` case; default path `~/.local/bin/zellij` |
 | python3 | parses the transcript JSONL and the state JSON |
@@ -40,8 +40,8 @@ the compactions.
 | `handoff-plain` | claude runs with every channel variable unset and `WARMFOLD_FORCE_CHANNEL=none` (see the channel note below) | the state phase reaches `handoff_done` within the deadline; then the handoff `.md` exists in this case's handoff tree and holds all seven headings (`Goal`, `Current state`, `Decisions made`, `Open tasks`, `Key files and paths`, `Next step`, `Things to avoid`) as heading lines in order; `channel` is `none` |
 | `guard-cold` | as `handoff-plain`, plus `WARMFOLD_FORCE_TTL_SECONDS=30`, `WARMFOLD_GUARD=1`, `WARMFOLD_GUARD_MIN_USD=0.0001`, `WARMFOLD_GUARD_ACK_SECONDS=60`; the test waits for `phase = handoff_done` (the watcher acts before the forced expiry), then waits 60 s for the real expiry, then sends a prompt | the pane gains new lines with `full cost` and `warmfold`; the blocked submit adds no user record and no assistant usage record to the transcript; a second submit within the ack window runs a full turn and adds both records |
 | `clear-loads-handoff` | runs the handoff flow, then `/clear`, then asks `what is the handoff goal` | `latest.json` gets a positive `consumed_at` after the `/clear` submission time and holds non-empty `cwd`, `session_id`, `saved_at`, `path`; the new assistant record contains the case's story identifier word |
-| `status-local` | `/warmfold:status` at the prompt | the report appears in new screen lines only (a diff against the pre-command capture); one new line is exactly `warmfold status` (the autocomplete menu holds the words inside a longer line), and the labels `Session:`, `Model:`, `TTL:`, `Channel:`, `Mode:`, `Next action:` each start a new line; the poll runs up to 30 s; the command adds no user record and no assistant usage record |
-| `savings` | as `compact-tmux`; after the compact asserts, `/warmfold:savings`, then the return prompt `Count from 1 to 3.` | the report appears in new screen lines; one new line is exactly `warmfold savings` (the autocomplete menu line also holds the words), and `realized saved`, `wasted`, `net`, `pending actions` each start a new line; the poll runs up to 30 s and the screen at the match lands in `screen-savings-report.txt`; the command adds no user record and no assistant usage record; `data/ledger.jsonl` holds exactly one `type=action` line with `action=compact` and one `type=outcome` line with `outcome=early` (the return lands long before `cold_at` under the forced 1 h ttl; DESIGN.md section 12) |
+| `status-local` | `/warmfold:status` at the prompt | the report appears in new screen lines (a diff against the pre-command capture); one new line is exactly `warmfold status` (the autocomplete menu holds the words inside a longer line), and the labels `Session:`, `Model:`, `TTL:`, `Channel:`, `Mode:`, `Next action:` each start a new line; the poll runs up to 30 s; the command completes through a normal assistant turn |
+| `savings` | as `compact-tmux`; after the compact asserts, `/warmfold:savings`, then the return prompt `Count from 1 to 3.` | the report appears in new screen lines; one new line is exactly `warmfold savings` (the autocomplete menu line also holds the words), and `realized saved`, `wasted`, `net`, `pending actions` each start a new line; the poll runs up to 30 s and the screen at the match lands in `screen-savings-report.txt`; the command completes through a normal assistant turn; `data/ledger.jsonl` holds exactly one `type=action` line with `action=compact` and one `type=outcome` line with `outcome=early` (the return lands long before `cold_at` under the forced 1 h ttl; DESIGN.md section 12) |
 | `zellij` | claude runs as the one pane of a new zellij session; the layout command unsets `TMUX` and `TMUX_PANE`, so the channel is zellij | the same checks as `compact-tmux`, but `channel` is `zellij` |
 
 Every case uses a fresh cwd under `$ART/cases/<case>/cwd` and a fresh data
@@ -158,6 +158,9 @@ Env overrides for the harness itself:
   assumption needs a new look.
 - The status labels come from the plugin's report builder. If the wording
   changes there, the label list in `case_status_local` changes with it.
+- Status and savings reports are computed locally by the hook, then rendered
+  through Claude's normal response path. Their user and assistant turns can
+  therefore appear in the transcript and use the usual API request.
 - zellij 0.45.1 starts a new named session with
   `zellij --session NAME --new-session-with-layout FILE`. The plain
   `--layout` flag targets an existing session and fails for a new one. The

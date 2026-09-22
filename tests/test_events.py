@@ -671,6 +671,39 @@ def test_watch_channel_none_disables_detection(monkeypatch, env):
     assert events._detect_channel(dict(env.cfg, force_channel="")).name == "stub"
 
 
+def test_t3_channel_requires_exact_payload_identity_and_preserves_uncertain(
+    monkeypatch, env
+):
+    class Result:
+        status = "uncertain"
+        reason = "dispatch outcome uncertain"
+        accepted = False
+
+    seen = {}
+    fake_t3 = types.ModuleType("warmfoldlib.t3")
+    fake_t3.REJECTED = "rejected"
+    fake_t3.UNCERTAIN = "uncertain"
+    fake_t3.resolve_target = lambda session, cwd, db: seen.update(
+        {"session": session, "cwd": cwd, "db": db}
+    ) or types.SimpleNamespace(accepted=True, reason="target resolved")
+    fake_t3.request_compact = lambda session, cwd, cfg, log=None: Result()
+    monkeypatch.setitem(sys.modules, "warmfoldlib.t3", fake_t3)
+    monkeypatch.setattr(warmfoldlib, "t3", fake_t3, raising=False)
+    stub = types.ModuleType("warmfoldlib.channels")
+    stub.detect = lambda cfg, log=None: None
+    monkeypatch.setitem(sys.modules, "warmfoldlib.channels", stub)
+    monkeypatch.setattr(warmfoldlib, "channels", stub, raising=False)
+
+    payload = {"session_id": "sdk-session", "cwd": str(env.tmp_path)}
+    channel = events._detect_channel(
+        dict(env.cfg, force_channel=""), str(env.tmp_path), payload
+    )
+    assert channel.name == "t3"
+    assert seen == {"session": "sdk-session", "cwd": str(env.tmp_path), "db": None}
+    assert channel.inject_compact() is False
+    assert channel.outcome == "uncertain"
+
+
 def test_watch_no_rearm_after_postcompact_in_same_idle_period(monkeypatch, env):
     # PostCompact stamped last_compact_at after the user last typed; the
     # next Stop must not arm again.
@@ -914,12 +947,14 @@ def test_prompt_status_interception(monkeypatch, env):
     payload = dict(env.payload, prompt="/warmfold:status")
     out, code = events.prompt(payload, env.cfg)
     assert code == 0
-    assert out["decision"] == "block"
-    assert out["suppressOriginalPrompt"] is True
-    assert "warmfold status" in out["reason"]
-    assert "Session: sess-test" in out["reason"]
-    assert "Cold return cost:" in out["reason"]
-    assert load_state(env)["activity_at"] == 0.0  # status is not activity
+    assert "decision" not in out
+    assert "suppressOriginalPrompt" not in out
+    assert out["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    context = out["hookSpecificOutput"]["additionalContext"]
+    assert "warmfold status" in context
+    assert "Session: sess-test" in context
+    assert "Cold return cost:" in context
+    assert load_state(env)["activity_at"] == T
 
 
 def test_prompt_records_activity_and_resets_phase(monkeypatch, env):
@@ -1493,19 +1528,57 @@ def test_session_start_clear_settles_consumed_handoff_early(monkeypatch, env):
     assert outcomes[0]["saved_usd"] == pytest.approx(-0.11)
 
 
-def test_prompt_local_commands_add_no_state_or_ledger_change(monkeypatch, env):
+def test_prompt_report_commands_follow_normal_bookkeeping(monkeypatch, env):
     install_clock(monkeypatch)
     save_state(env, armed_token=T - 300.0, transcript_path=env.tpath)
-    before = load_state(env)
     for command in ("/warmfold:status", "/warmfold:savings"):
         out, code = events.prompt(dict(env.payload, prompt=command), env.cfg)
         assert code == 0
-        assert out["decision"] == "block"
-        assert out["suppressOriginalPrompt"] is True
-        assert load_state(env) == before
+        assert "decision" not in out
+        assert "suppressOriginalPrompt" not in out
+        assert out["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+        assert load_state(env)["activity_at"] == T
     assert not os.path.exists(
         os.path.join(env.data_dir, "ledger.jsonl")
     )
+
+
+def test_prompt_savings_settles_pending_action_before_rendering_report(
+    monkeypatch, env
+):
+    install_clock(monkeypatch)
+    env.cfg["force_ttl_seconds"] = 3600
+    append_handoff_action(env, cold_at=T - 400.0)
+    write_transcript(env.tpath, [user_line(T - 10), asst_line(T - 5)])
+
+    out, code = events.prompt(
+        dict(env.payload, prompt="/warmfold:savings"), env.cfg
+    )
+
+    assert code == 0
+    context = out["hookSpecificOutput"]["additionalContext"]
+    assert "This session: handoff at" in context
+    assert "realized, saved" in context
+    assert outcomes(env)[0]["outcome"] == "realized"
+
+
+def test_prompt_report_respects_guard_setting(monkeypatch, env):
+    install_clock(monkeypatch)
+    env.cfg.update({"force_ttl_seconds": 3600, "guard_min_usd": 1.0})
+    write_transcript(env.tpath, [user_line(T - 4000), asst_line(T - 3990)])
+
+    out, _ = events.prompt(
+        dict(env.payload, prompt="/warmfold:status"), env.cfg
+    )
+    assert out["decision"] == "block"
+    assert "hookSpecificOutput" not in out
+
+    env.cfg["guard"] = False
+    out, _ = events.prompt(
+        dict(env.payload, prompt="/warmfold:status"), env.cfg
+    )
+    assert "decision" not in out
+    assert "warmfold status" in out["hookSpecificOutput"]["additionalContext"]
 
 
 def test_prompt_savings_interception_shows_the_report(monkeypatch, env):
@@ -1514,10 +1587,20 @@ def test_prompt_savings_interception_shows_the_report(monkeypatch, env):
         dict(env.payload, prompt="  /warmfold:savings  "), env.cfg
     )
     assert code == 0
-    assert out["decision"] == "block"
-    assert out["suppressOriginalPrompt"] is True
-    assert "warmfold savings" in out["reason"]
-    assert "This session: no actions yet" in out["reason"]
+    assert "decision" not in out
+    assert "suppressOriginalPrompt" not in out
+    context = out["hookSpecificOutput"]["additionalContext"]
+    assert "warmfold savings" in context
+    assert "This session: no actions yet" in context
+
+
+def test_prompt_report_command_requires_an_exact_match(monkeypatch, env):
+    install_clock(monkeypatch)
+    out, code = events.prompt(
+        dict(env.payload, prompt="/warmfold:statuswhatever"), env.cfg
+    )
+    assert (out, code) == (None, 0)
+    assert load_state(env)["activity_at"] == T
 
 
 # ---------------------------------------------------------------------------
@@ -1641,12 +1724,12 @@ def test_savings_interception_survives_a_corrupt_ledger(monkeypatch, env):
         dict(env.payload, prompt="/warmfold:savings"), env.cfg
     )
     assert code == 0
-    assert out["decision"] == "block"
-    assert out["suppressOriginalPrompt"] is True
-    assert "warmfold savings" in out["reason"]
+    assert "decision" not in out
+    assert "suppressOriginalPrompt" not in out
+    assert "warmfold savings" in out["hookSpecificOutput"]["additionalContext"]
 
 
-def test_broken_report_still_blocks_the_local_command(monkeypatch, env):
+def test_broken_report_reaches_claude_as_a_useful_response(monkeypatch, env):
     install_clock(monkeypatch)
 
     def boom(cfg, session_id):
@@ -1656,9 +1739,9 @@ def test_broken_report_still_blocks_the_local_command(monkeypatch, env):
     out, _ = events.prompt(
         dict(env.payload, prompt="/warmfold:savings"), env.cfg
     )
-    assert out["decision"] == "block"
-    assert out["suppressOriginalPrompt"] is True
-    assert "warmfold: report failed:" in out["reason"]
+    assert "decision" not in out
+    assert "suppressOriginalPrompt" not in out
+    assert "warmfold: report failed: boom" in out["hookSpecificOutput"]["additionalContext"]
 
 
 def test_watch_handoff_reply_stores_the_action_id(monkeypatch, env):
@@ -1798,13 +1881,16 @@ def test_cli_prompt_warm_writes_no_stdout(tmp_path, env):
 
 
 def test_cli_prompt_status_interception(tmp_path, env):
+    tpath = str(tmp_path / "cli-status.jsonl")
+    current = time.time()
+    write_transcript(tpath, [user_line(current - 100.0), asst_line(current - 90.0)])
     result = run_cli(
         ["prompt"],
         json.dumps(
             {
                 "session_id": "cli-2",
                 "prompt": "/warmfold:status",
-                "transcript_path": env.tpath,
+                    "transcript_path": tpath,
                 "cwd": str(tmp_path),
             }
         ),
@@ -1812,8 +1898,10 @@ def test_cli_prompt_status_interception(tmp_path, env):
     )
     assert result.returncode == 0
     obj = json.loads(result.stdout)
-    assert obj["decision"] == "block"
-    assert obj["suppressOriginalPrompt"] is True
+    assert "decision" not in obj
+    assert "suppressOriginalPrompt" not in obj
+    assert obj["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    assert "warmfold status" in obj["hookSpecificOutput"]["additionalContext"]
 
 
 def test_cli_status_event_prints_report(tmp_path, env):

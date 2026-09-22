@@ -28,6 +28,16 @@ DEFAULTS = {
     "data_dir": "",
     "force_ttl_seconds": 0.0,
     "force_channel": "",
+    # Native T3 integration. Empty values select the installed local defaults
+    # in t3.py/t3_auth.py; these are override points for tests and custom T3
+    # homes, not secrets.
+    "t3_app_path": "",
+    "t3_server_bin": "",
+    "t3_base_dir": "",
+    "t3_db_path": "",
+    "t3_runtime_path": "",
+    "t3_origin": "",
+    "t3_token_path": "",
 }
 
 _NUMBER_KEYS = frozenset(
@@ -55,8 +65,11 @@ def default_data_dir():
     plugin_data = os.environ.get("CLAUDE_PLUGIN_DATA") or ""
     if plugin_data:
         return plugin_data
+    config_home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
+        os.path.expanduser("~"), ".claude"
+    )
     return os.path.join(
-        os.path.expanduser("~"), ".claude", "warmfold"
+        os.path.expanduser(config_home), "plugins", "data", "warmfold-warmfold-local"
     )
 
 
@@ -120,8 +133,15 @@ def load():
 
     # 2. $CLAUDE_PLUGIN_DATA/config.json
     plugin_data = os.environ.get("CLAUDE_PLUGIN_DATA") or ""
-    if plugin_data:
-        path = os.path.join(plugin_data, "config.json")
+    # Manual commands often run outside Claude's hook environment, where
+    # CLAUDE_PLUGIN_DATA is absent. Read the canonical installed data dir in
+    # that case, while an explicit WARMFOLD_DATA_DIR remains an isolated test
+    # override and must not inherit the installed config.
+    config_data = plugin_data or (
+        "" if os.environ.get("WARMFOLD_DATA_DIR") else cfg["data_dir"]
+    )
+    if config_data:
+        path = os.path.join(config_data, "config.json")
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 values = json.load(handle)

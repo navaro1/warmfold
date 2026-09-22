@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "warmfold",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Compacts or hands off an idle session before the prompt cache expires, so the first request after a break is cheap.",
   "author": {
     "name": "Piotr Lewandowski"

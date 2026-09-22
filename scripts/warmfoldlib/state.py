@@ -34,6 +34,8 @@ _PHASES = frozenset(
         "handoff_done",
         "keepalive_pending",
         "compact_sent",
+        "compact_pending",
+        "compact_deferred",
         "cold",
         "done",
     )

@@ -16,7 +16,7 @@ code. Prose in this repo follows ASD-STE100 Simplified Technical English.
 | Hooks cannot run slash commands. Scheduled tasks (cron, `/loop`) deliver built-in commands as plain text. | Only a keystroke in a terminal, or the user, can run `/compact`. |
 | An `async: true, asyncRewake: true` command hook that exits 2 wakes Claude even while the session is idle. Its stderr reaches Claude as a system reminder. | This is the universal idle trigger. It works in the CLI, Desktop app, VS Code, and SDK hosts such as T3 Code. |
 | `Stop` input has `last_assistant_message`, `background_tasks`, `session_crons`. `Stop` does not fire on user interrupt. `StopFailure` fires on API errors. | The watcher saves the handoff text from `last_assistant_message`. |
-| `UserPromptSubmit` can block a prompt (`decision: "block"`, `reason`, `suppressOriginalPrompt`). The prompt is erased. No API call happens. | The return guard and the local `/warmfold:status` command cost zero tokens. |
+| `UserPromptSubmit` can block a prompt (`decision: "block"`, `reason`, `suppressOriginalPrompt`) or add `hookSpecificOutput.additionalContext` for the normal response path. | The return guard still applies to every real turn. `/warmfold:status` and `/warmfold:savings` compute read-only reports locally after normal prompt bookkeeping, then ask Claude to render them verbatim through a normal response. |
 | `SessionStart` matchers: `startup`, `resume`, `clear`, `compact`. Its `additionalContext` reaches Claude. | The handoff loader injects the saved handoff after `/clear`. |
 | `Notification/idle_prompt` fires ~60 s after Claude stops, only if the user typed nothing. | Hint that the input box is empty. |
 | Hook processes inherit the environment of the `claude` process (`TMUX_PANE`, `ZELLIJ_SESSION_NAME`, `KITTY_LISTEN_ON`, `WEZTERM_PANE`, `STY`). Hooks run without a controlling tty. | Channel detection uses env vars. Injection uses the multiplexer CLI, never `/dev/tty`. |
@@ -33,7 +33,7 @@ warmfold/
   .claude-plugin/plugin.json      manifest, userConfig, hooks path
   .claude-plugin/marketplace.json local marketplace so `claude plugin marketplace add <dir>` works
   hooks/hooks.json                all hook wiring, exec form
-  commands/status.md              /warmfold:status (intercepted locally by the guard)
+  commands/status.md              /warmfold:status (report rendering instruction)
   scripts/warmfold.py               single CLI entry: python3 warmfold.py <event>
   scripts/warmfoldlib/              package: config.py transcript.py state.py cost.py
                                   channels.py actions.py events.py log.py
@@ -82,7 +82,7 @@ Precedence, first match wins:
 
 ```
 armed_token      float  epoch of the Stop that owns the current watcher
-phase            str    idle | handoff_pending | handoff_done | keepalive_pending | compact_sent | cold | done
+phase            str    idle | handoff_pending | handoff_done | keepalive_pending | compact_sent | compact_pending | compact_deferred | cold | done
 activity_at      float  last UserPromptSubmit
 idle_confirmed_at float last Notification idle_prompt
 guard_ack_until  float
@@ -127,13 +127,13 @@ All read JSON from stdin. All exit 0 with optional JSON on stdout unless stated.
      - `due = idle >= idle_minutes*60 or (expires_at - now) <= 60`.
      - If `ttl == 300`: apply `ttl_5m_policy` (`warn` and `off` → exit 0; `compact_at_4m` → `due = idle >= 240`).
      - If not due: continue.
-     - Resolve mode. `auto` → `compact` if `channels.detect()` returns a verified channel, else `handoff`.
-     - `compact`: `channels.inject_compact()`. On success `phase = compact_sent`, `last_action_at`, exit 0. On failure fall back to `handoff`.
+     - Resolve mode. `auto` → `compact` if a verified native terminal channel or an exact idle T3 target exists, else `handoff`.
+     - `compact`: inject through the verified channel. On success `phase = compact_sent`, `last_action_at`, exit 0. A rejected T3 request falls back to `handoff`; an accepted or uncertain T3 request records `compact_pending` and never sends a duplicate handoff. A recognized native terminal with a draft, dialog, or changed prompt records `compact_deferred` and skips the handoff fallback.
      - `handoff`: `phase = handoff_pending`, write state, print the HANDOFF_REMINDER to stderr, exit 2.
      - `keepalive`: if `wake_count * 55 min < keepalive_hours*3600`: `phase = keepalive_pending`, print KEEPALIVE_REMINDER to stderr, exit 2. Else `handoff`.
      - `warn`: exit 0.
 - `prompt` (UserPromptSubmit, sync, timeout 10):
-  1. If `prompt.strip()` starts with `/warmfold:status`: build the status report, output `{"decision":"block","reason":<report>,"suppressOriginalPrompt":true}`, exit 0.
+  1. If `prompt.strip()` exactly equals `/warmfold:status` or `/warmfold:savings`, run the normal activity/reset, configured guard, and pending-action settlement path. After a passing submit, build the read-only report and output `{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":<report plus verbatim rendering instruction>}}`, exit 0. Do not block or suppress the command. Claude renders the report through a normal response, which uses the usual API request and is recorded in the transcript.
   2. `activity_at = now`. If `phase` in `(handoff_done, keepalive_pending, compact_sent, cold, done)`: `phase = idle`, `wake_count = 0`.
   3. Guard: read transcript. `cold = now > last_request_start + ttl`. If `guard` and cold and `context_tokens >= min_context_tokens` and `cold_cost_usd >= guard_min_usd` and `now > guard_ack_until`: set `guard_ack_until = now + guard_ack_seconds`, output block JSON with the GUARD_MESSAGE (idle duration, context tokens, model, estimated cost, handoff hint if a fresh handoff exists, "resend to continue at full cost"). `suppressOriginalPrompt: false`.
 - `session-start` (SessionStart, matchers `startup|resume|clear|compact`): reset watcher state for the new session id. On `clear` (and `startup` when configured): if `latest.json` for this cwd is fresh and unconsumed, output `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":<handoff with a header>},"systemMessage":"warmfold: loaded handoff from <time>"}` and mark consumed. On `startup` with `handoff_autoload = clear`: inject one line only: "A warmfold handoff from <time> exists at <path>. Read it only if the user continues that work."
@@ -164,6 +164,9 @@ KEEPALIVE_REMINDER: `warmfold keep-alive. Reply with exactly: ok`
 | wezterm | `WEZTERM_PANE` | `wezterm cli get-text --pane-id $WEZTERM_PANE` | `wezterm cli send-text --pane-id $WEZTERM_PANE --no-paste` with the same bytes |
 | kitty | `KITTY_WINDOW_ID` and `KITTY_LISTEN_ON` | `kitten @ --to $KITTY_LISTEN_ON get-text --match id:$KITTY_WINDOW_ID` | `kitten @ --to ... send-text --match id:... <bytes>` |
 | screen | `STY` | `screen -S $STY -X hardcopy <tmpfile>` | `screen -S $STY -X stuff <bytes>` |
+| Apple Terminal.app | `TERM_PROGRAM=Apple_Terminal`, parent tty | AppleScript `contents` from the tab whose `tty` matches the Claude parent | AppleScript `do script` in that exact tab |
+| Ghostty | `TERM_PROGRAM=ghostty`, parent tty, macOS AppleScript | temporary OSC-2 title nonce written to the parent tty, matched to exactly one native terminal id; screen via `write_screen_file:copy` | AppleScript `input text` plus `send key enter` to that exact id |
+| T3 Code | exact hook `session_id` plus `cwd`, native local T3 state and loopback API | read-only SQLite target resolution, then scoped native bearer dispatch | one `thread.turn.start` with `/compact`; accepted and uncertain outcomes never fall back to a handoff |
 
 `force_channel = none` disables all. Verification before typing, on every attempt:
 
@@ -172,6 +175,18 @@ KEEPALIVE_REMINDER: `warmfold keep-alive. Reply with exactly: ok`
 3. Zellij dumps the focused pane. If the fingerprint fails, do not type. Log it.
 
 After injecting, wait 3 s, capture again. Success = the prompt line no longer contains `/compact`, or the screen contains `Compacted` / `compact`. Return `True`/`False`. On the first tmux capture failure treat the channel as absent.
+
+Apple Terminal submits `/compact` as one complete `do script` operation because
+its scripting dictionary does not expose staged key input. It therefore acts
+only when the exact tab's visible contents pass the prompt fingerprint and the
+input box is empty. Ghostty exposes no screen contents as a property in its
+public scripting dictionary. The hook writes a temporary OSC-2 title nonce to
+the Claude parent tty, requires exactly one matching terminal id, asks that id
+to write its screen to a fresh temporary file through `write_screen_file:copy`,
+and restores every advertised pasteboard type only while the captured path
+and native change count still match. An
+ambiguous, unavailable, or changed target is treated as no channel and uses
+handoff mode.
 
 `inject_compact()` never sends anything if the fingerprint fails.
 
@@ -183,7 +198,7 @@ After injecting, wait 3 s, capture again. Success = the prompt line no longer co
 
 ## 9. Plugin manifest and hooks
 
-`plugin.json`: `name: "warmfold"`, `version: "0.1.0"`, `description`, `author`, `hooks: "./hooks/hooks.json"`, `commands: "./commands"`, `userConfig` as in section 3.
+`plugin.json`: `name: "warmfold"`, `version: "0.1.2"`, `description`, `author`, `hooks: "./hooks/hooks.json"`, `commands: "./commands"`, `userConfig` as in section 3.
 
 `hooks/hooks.json` uses exec form: `{"type":"command","command":"python3","args":["${CLAUDE_PLUGIN_ROOT}/scripts/warmfold.py","<event>"],"timeout":N}`. Verify in the docs that `${CLAUDE_PLUGIN_ROOT}` substitutes inside `args`. If it does not, use `command: "${CLAUDE_PLUGIN_ROOT}/scripts/warmfold.py"` with a `#!/usr/bin/env python3` shebang and `args: ["<event>"]`, and make the file executable.
 
@@ -201,7 +216,7 @@ Real `claude` sessions in tmux, model `claude-haiku-4-5`, `--plugin-dir <repo>`,
 | `handoff-plain` | claude inside tmux started with `env -u TMUX -u TMUX_PANE`, so no channel | handoff file exists within 3 min; content has the headings; state `handoff_done` |
 | `guard-cold` | as handoff-plain plus `WARMFOLD_FORCE_TTL_SECONDS=30`; wait 90 s; type a prompt | the pane shows the guard message; the prompt was not sent; a second submit passes |
 | `clear-loads-handoff` | after handoff-plain, type `/clear`, then ask "what is the handoff goal" | the answer quotes the handoff |
-| `status-local` | type `/warmfold:status` | the pane shows the report; no assistant message appears in the transcript |
+| `status-local` | type `/warmfold:status` | the pane shows the report through a normal assistant response and the command turn appears in the transcript |
 | `zellij` | claude inside a zellij session (`zellij --session warmfold-test`) | same assertion as compact-tmux |
 
 Each case creates the trust in the temp cwd first (the trust dialog appears on a new directory: send `Down Enter`). The first prompt of each session is `Say the word ready and stop.` to get a turn. Add a second prompt that makes the context larger than 1000 tokens (ask for a 600-word text).
@@ -240,7 +255,7 @@ Rules, evaluated in `prompt` (UserPromptSubmit) and `session-start` (matcher `cl
 - `paid_cold` (handoff only): the user passed the guard and continued on the old context. `saved_usd = -paid_usd`.
 Each action gets at most one outcome. Actions without an outcome are `pending`.
 
-Report (`/warmfold:savings`, intercepted locally by the prompt hook, zero API cost; also `python3 warmfold.py savings`):
+Report (`/warmfold:savings`, computed locally by the prompt hook and rendered by Claude; also `python3 warmfold.py savings` for a shell-only report):
 ```
 warmfold savings
                  today   last 7 days   all time

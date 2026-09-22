@@ -11,11 +11,14 @@ import pytest  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def clean_env(monkeypatch):
+def clean_env(monkeypatch, tmp_path):
     for name in list(os.environ):
         if name.startswith(("WARMFOLD_", "CLAUDE_PLUGIN_OPTION_")):
             monkeypatch.delenv(name, raising=False)
     monkeypatch.delenv("CLAUDE_PLUGIN_DATA", raising=False)
+    # Keep the user's installed config out of unit tests; the canonical-path
+    # behavior has a focused test below.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
 
 
 def test_defaults_when_no_overrides():
@@ -34,12 +37,43 @@ def test_defaults_when_no_overrides():
     assert cfg["poll_seconds"] == 15.0
     assert cfg["force_ttl_seconds"] == 0.0
     assert cfg["force_channel"] == ""
+    assert cfg["t3_token_path"] == ""
+    assert cfg["t3_runtime_path"] == ""
+
+
+def test_t3_path_overrides_are_loaded(monkeypatch):
+    monkeypatch.setenv("WARMFOLD_T3_DB_PATH", "/tmp/t3/state.sqlite")
+    monkeypatch.setenv("WARMFOLD_T3_ORIGIN", "http://127.0.0.1:3773")
+    cfg = config.load()
+    assert cfg["t3_db_path"] == "/tmp/t3/state.sqlite"
+    assert cfg["t3_origin"] == "http://127.0.0.1:3773"
 
 
 def test_data_dir_defaults_to_home(monkeypatch):
     monkeypatch.setenv("HOME", "/home/tester")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     cfg = config.load()
-    assert cfg["data_dir"] == "/home/tester/.claude/warmfold"
+    assert cfg["data_dir"] == "/home/tester/.claude/plugins/data/warmfold-warmfold-local"
+
+
+def test_data_dir_uses_claude_config_dir(monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/custom/claude")
+    cfg = config.load()
+    assert cfg["data_dir"] == "/custom/claude/plugins/data/warmfold-warmfold-local"
+
+
+def test_canonical_config_is_loaded_without_plugin_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    data_dir = tmp_path / "claude" / "plugins" / "data" / "warmfold-warmfold-local"
+    data_dir.mkdir(parents=True)
+    (data_dir / "config.json").write_text(
+        '{"t3_origin":"http://127.0.0.1:3773",'
+        '"t3_token_path":"private/t3.json"}',
+        encoding="utf-8",
+    )
+    cfg = config.load()
+    assert cfg["t3_origin"] == "http://127.0.0.1:3773"
+    assert cfg["t3_token_path"] == "private/t3.json"
 
 
 def test_data_dir_from_plugin_data(monkeypatch):

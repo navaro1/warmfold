@@ -33,6 +33,12 @@ def test_save_and_load_roundtrip(tmp_path):
     assert loaded["cwd"] == "/tmp/work"
 
 
+@pytest.mark.parametrize("phase", ["compact_pending", "compact_deferred"])
+def test_native_compaction_outcomes_are_valid_phases(tmp_path, phase):
+    state.save(str(tmp_path), "native", {"phase": phase})
+    assert state.load(str(tmp_path), "native")["phase"] == phase
+
+
 def test_corrupt_file_treated_as_empty(tmp_path):
     state.save(str(tmp_path), "sess-2", {"phase": "cold"})
     path = state.session_path(str(tmp_path), "sess-2")

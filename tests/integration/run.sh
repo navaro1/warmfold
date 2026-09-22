@@ -13,7 +13,7 @@
 # state files, the handoff files, the transcript, and the pane screen.
 # Every case gets its own data directory under $ART/cases/<case>/data.
 #
-# Requirements: bash 4+, tmux, python3, and the claude CLI on PATH.
+# Requirements: bash 3.2+, tmux, python3, and the claude CLI on PATH.
 # See README.md for the environment overrides and the artifact layout.
 set -u
 
@@ -327,10 +327,10 @@ case_status_local() {
   done
   local t
   t="$(latest_transcript "$CURRENT_CWD")"
-  if [ -n "$t" ] && transcript_has_no_records_after "$t" "$PROMPT_OFFSET"; then
-    check "status command added no user or assistant record" 0
+  if [ -n "$t" ] && transcript_turn_after "$t" "$PROMPT_OFFSET"; then
+    check "status command completed a normal assistant turn" 0
   else
-    check "status command added no user or assistant record" 1 \
+    check "status command completed a normal assistant turn" 1 \
       "transcript: $t offset: $PROMPT_OFFSET"
   fi
   end_case
@@ -374,10 +374,10 @@ case_savings() {
   done
   local t
   t="$(latest_transcript "$CURRENT_CWD")"
-  if [ -n "$t" ] && transcript_has_no_records_after "$t" "$PROMPT_OFFSET"; then
-    check "savings command added no user or assistant record" 0
+  if [ -n "$t" ] && transcript_turn_after "$t" "$PROMPT_OFFSET"; then
+    check "savings command completed a normal assistant turn" 0
   else
-    check "savings command added no user or assistant record" 1 \
+    check "savings command completed a normal assistant turn" 1 \
       "transcript: $t offset: $PROMPT_OFFSET"
   fi
   # The first user return after the action lands long before cold_at

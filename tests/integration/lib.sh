@@ -196,7 +196,13 @@ latest_transcript() { # <cwd> -> newest transcript path, or empty
 }
 
 transcript_size() { # <transcript> -> byte size, 0 when absent
-  stat -c%s "$1" 2>/dev/null || printf '0'
+  # BSD/macOS stat has no GNU -c%s.  Python is already a test requirement
+  # and gives the same byte offset on both platforms.
+  python3 -c 'import os, sys
+try:
+    print(os.path.getsize(sys.argv[1]))
+except OSError:
+    print(0)' "$1" 2>/dev/null || printf '0'
 }
 
 # transcript_turn_after <transcript> <byte-offset>

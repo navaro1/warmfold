@@ -43,6 +43,17 @@ claude plugin validate /path/to/warmfold
 claude plugin list | grep warmfold
 ```
 
+For T3 Code, enroll the plugin's native local dispatch credential when first
+setting it up, then check its non-secret readiness report. Hooks may renew a
+near-expiry enrolled bearer only after confirming the local T3 session is
+active; expired, revoked, malformed, or offline credentials require this
+explicit setup again.
+
+```
+python3 /path/to/warmfold/scripts/warmfold.py t3-setup
+python3 /path/to/warmfold/scripts/warmfold.py t3-status
+```
+
 Open a session. Run `/warmfold:status`. Defaults work with no configuration. The line `6 userConfig options not yet set` after install is safe to ignore.
 
 ## What happens on each client
@@ -54,10 +65,12 @@ Open a session. Run `/warmfold:status`. Defaults work with no configuration. The
 | Terminal in kitty | Compact in place (untested) |
 | Terminal in WezTerm | Compact in place (untested) |
 | Terminal in GNU screen | Compact in place (untested) |
-| Plain terminal | Handoff |
+| Apple Terminal.app | Compact in the exact Claude tab (macOS) |
+| Ghostty | Compact in the exact terminal identified by a temporary title nonce (macOS) |
+| Plain terminal without a supported terminal API | Handoff |
 | Claude Desktop app | Handoff |
 | VS Code extension | Handoff |
-| T3 Code | Handoff |
+| T3 Code | Compact in place through its native local orchestration API (after `t3-setup`) |
 
 Return flow: type anything. The guard message appears. Run `/clear`. The handoff loads. Continue.
 
@@ -70,10 +83,10 @@ Live tests on 2026-09-21 with Claude Code 2.1.278 on Linux. Each test used a rea
 | tmux 3.2a | compact in place (keystrokes) | pass, one compaction, no loop |
 | zellij 0.45.1 | compact in place (keystrokes, `--pane-id`) | pass |
 | Plain terminal (raw pty, no multiplexer) | handoff (wake) | pass |
-| T3 Code desktop 0.0.39 nightly (Agent SDK) | handoff (wake) | pass, hooks loaded from the user-scope plugin |
+| T3 Code desktop 0.0.43 nightly (Agent SDK) | native `/compact` dispatch | proof reduced the context from 30940 to 6082 tokens; hooks loaded from the user-scope plugin |
 | Cold return guard | block once, then pass | pass |
 | `/clear` handoff loader | injects the saved handoff | pass |
-| `/warmfold:status` | local report, no API call | pass |
+| `/warmfold:status` | local report rendered by the normal Claude response path | pass |
 
 ## Configure
 
@@ -122,7 +135,10 @@ Rows 2 and 5 match any letter case. To keep 1 hour on an API key, set `"promptCa
 
 ## Savings
 
-Run `/warmfold:savings`. The plugin answers locally, with no API call.
+Run `/warmfold:savings`. The hook computes the report locally and supplies it
+to Claude as read-only context after the normal prompt bookkeeping. Claude
+then renders it through a normal response, so the command uses the session's
+usual API request and appears in the transcript.
 
 - realized: the return came after the cache expired. The action avoided the cold rebuild.
 - wasted: the return came early, or the guard passed on the old context. The action cost more than it saved.
@@ -139,12 +155,47 @@ Estimates use list prices. The ledger is `<data_dir>/ledger.jsonl`.
 - kitty, WezTerm, GNU screen: untested.
 - macOS Desktop app: untested. Run the Mac self-check.
 
+The macOS terminal channels use native terminal scripting. Apple Terminal is
+matched by the controlling tty of the Claude process. Ghostty receives a
+short-lived title nonce on that same tty; the plugin then selects the one
+Ghostty terminal whose native title contains that nonce. It captures that
+terminal through Ghostty's `write_screen_file:copy` action, validates the
+fresh temporary file before reading it, and restores every advertised
+pasteboard type only when the native change count still matches the plugin's
+capture path. The plugin
+never focuses a window or sends a global keyboard event. If the target,
+screen capture, or prompt fingerprint cannot be verified exactly, it falls
+back to the handoff flow.
+
 ## Mac self-check
 
-1. Run `/config`. Set `idle_minutes` to `1` and `min_context_tokens` to `1000`.
-2. Start a session. Ask for a 600-word answer. Stay idle for 2 minutes. Expect a handoff and a `.md` file under `~/.claude/plugins/data/warmfold-warmfold-local/handoffs/`.
-3. Type anything. Expect the guard message once.
-4. Run `/clear`. Expect the handoff content to load. Set both options back.
+1. Start a fresh temporary workspace with the isolated native smoke command
+   shown below. Set `idle_minutes` to `1` and `min_context_tokens` to `1000`.
+2. Send a small prompt, wait for the turn to stop, and stay idle for about 2
+   minutes. Expect exactly one `compact_boundary`, `phase=compact_sent`, and
+   no handoff reminder. Repeat once in Apple Terminal and once in Ghostty.
+3. Before the Ghostty run, copy rich text. Confirm the clipboard contents and
+   types are unchanged after the screen capture.
+
+The native Terminal/Ghostty path has not been GUI-live-tested by this agent;
+the desktop automation policy blocks controlling those apps. macOS may ask
+for Automation permission for the selected terminal in System Settings →
+Privacy & Security → Automation.
+
+```sh
+# Run this snippet from the warmfold checkout.
+repo="$(git rev-parse --show-toplevel)"
+d="$(mktemp -d /tmp/warmfold-native.XXXXXX)"
+mkdir -p "$d/cwd" "$d/data"
+cd "$d/cwd" || exit 1
+WARMFOLD_DATA_DIR="$d/data" \
+WARMFOLD_IDLE_MINUTES=1 \
+WARMFOLD_MIN_CONTEXT_TOKENS=1000 \
+WARMFOLD_POLL_SECONDS=1 \
+WARMFOLD_FORCE_TTL_SECONDS=3600 \
+WARMFOLD_GUARD=0 \
+claude --plugin-dir "$repo"
+```
 
 ## Troubleshoot
 

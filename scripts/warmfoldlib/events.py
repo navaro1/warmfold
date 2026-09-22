@@ -109,7 +109,44 @@ def _utc_iso(epoch):
         return "unknown"
 
 
-def _detect_channel(cfg, data_dir=None):
+class _T3Channel:
+    """Adapter that keeps T3 dispatch outcomes distinct from keystrokes."""
+
+    name = "t3"
+
+    def __init__(self, session_id, cwd, cfg, log_fn=None):
+        self.session_id = session_id
+        self.cwd = cwd
+        self.cfg = cfg
+        self.log_fn = log_fn
+        self.outcome = None
+        self.reason = ""
+
+    def inject_compact(self):
+        try:
+            from . import t3
+
+            result = t3.request_compact(
+                self.session_id,
+                self.cwd,
+                self.cfg,
+                log=self.log_fn,
+            )
+            self.outcome = result.status
+            self.reason = result.reason
+            return result.accepted
+        except Exception as exc:
+            self.outcome = "rejected"
+            self.reason = "T3 dispatch failed"
+            if self.log_fn:
+                try:
+                    self.log_fn("t3: dispatch failed: %s" % type(exc).__name__)
+                except Exception:
+                    pass
+            return False
+
+
+def _detect_channel(cfg, data_dir=None, payload=None):
     """Return a verified channel or None.
 
     WP2 provides warmfoldlib.channels; until it exists (or when detection
@@ -117,23 +154,53 @@ def _detect_channel(cfg, data_dir=None):
     """
     if (cfg.get("force_channel") or "") == "none":
         return None
-    try:
-        from . import channels
-    except ImportError:
-        return None
     sink = None
     if data_dir:
         sink = lambda msg: log.append(data_dir, "channel", str(msg))  # noqa: E731
-    try:
-        return channels.detect(cfg, log=sink)
-    except Exception:
+    force = str(cfg.get("force_channel") or "").strip().lower()
+    if force != "t3":
+        try:
+            from . import channels
+
+            channel = channels.detect(cfg, log=sink)
+            if channel is not None:
+                return channel
+        except Exception:
+            pass
+    if force not in ("", "t3"):
         return None
+    payload = payload or {}
+    session_id = str(payload.get("session_id") or "").strip()
+    cwd = str(payload.get("cwd") or "").strip()
+    if not session_id or not cwd:
+        return None
+    try:
+        from . import t3
+
+        result = t3.resolve_target(
+            session_id,
+            cwd,
+            _t3_db_path(cfg),
+        )
+        if result.accepted:
+            return _T3Channel(session_id, cwd, cfg, sink)
+        if sink:
+            sink("t3: skipped; %s" % result.reason)
+    except Exception:
+        pass
+    return None
 
 
-def _resolve_mode(cfg):
+def _t3_db_path(cfg):
+    value = str(cfg.get("t3_db_path") or "").strip()
+    return value or None
+
+
+def _resolve_mode(cfg, payload=None):
     mode = cfg.get("mode") or "auto"
     if mode == "auto":
-        channel = _detect_channel(cfg, cfg.get("data_dir"))
+        channel_payload = dict(payload or {})
+        channel = _detect_channel(cfg, cfg.get("data_dir"), channel_payload)
         return "compact" if channel is not None else "handoff"
     return mode
 
@@ -469,7 +536,12 @@ def watch(payload, cfg):
                 return (None, 0)
 
         # 4. Arm.
-        channel = _detect_channel(cfg, cfg.get("data_dir"))
+        channel_payload = dict(payload)
+        if not channel_payload.get("session_id"):
+            channel_payload["session_id"] = session_id
+        if not channel_payload.get("cwd"):
+            channel_payload["cwd"] = st.get("cwd") or ""
+        channel = _detect_channel(cfg, cfg.get("data_dir"), channel_payload)
         st["armed_token"] = my_token
         st["phase"] = "idle"
         st["channel"] = channel.name if channel is not None else "none"
@@ -563,7 +635,12 @@ def watch(payload, cfg):
         if not due:
             continue
 
-        mode = _resolve_mode(cfg)
+        channel_payload = dict(payload)
+        if not channel_payload.get("session_id"):
+            channel_payload["session_id"] = session_id
+        if not channel_payload.get("cwd"):
+            channel_payload["cwd"] = cur.get("cwd") or st.get("cwd") or ""
+        mode = _resolve_mode(cfg, channel_payload)
         if mode == "warn":
             return (None, 0)
 
@@ -608,7 +685,8 @@ def watch(payload, cfg):
 
             if mode == "compact":
                 ok = False
-                channel = _detect_channel(cfg, cfg.get("data_dir"))
+                channel = _detect_channel(cfg, cfg.get("data_dir"), channel_payload)
+                previous_last_action = cur.get("last_action_at") or 0.0
                 if channel is not None:
                     # Stamp before the injection: sending the keystrokes is
                     # the action, even when the channel reports failure.
@@ -631,6 +709,20 @@ def watch(payload, cfg):
                             data_dir, "watch", "ledger action failed: %r" % (exc,)
                         )
                     log.append(data_dir, "watch", "phase=compact_sent")
+                    return (None, 0)
+                outcome = getattr(channel, "outcome", "") if channel is not None else ""
+                if outcome in ("uncertain", "deferred"):
+                    cur["phase"] = (
+                        "compact_pending" if outcome == "uncertain" else "compact_deferred"
+                    )
+                    if outcome == "deferred":
+                        cur["last_action_at"] = previous_last_action
+                    state.save(data_dir, session_id, cur)
+                    log.append(
+                        data_dir,
+                        "watch",
+                        "compact outcome %s; no handoff fallback" % outcome,
+                    )
                     return (None, 0)
                 log.append(data_dir, "watch", "compact failed; fall back to handoff")
                 mode = "handoff"
@@ -670,28 +762,13 @@ def prompt(payload, cfg):
     data_dir = cfg["data_dir"]
     session_id = payload.get("session_id") or "unknown"
     text = str(payload.get("prompt") or "")
-
-    # 1. Local commands: zero tokens, the prompt is erased, no state change.
     text = text.strip()
-    if text.startswith((STATUS_COMMAND, SAVINGS_COMMAND)):
-        try:
-            if text.startswith(SAVINGS_COMMAND):
-                report = _savings_report(cfg, session_id)
-                log.append(data_dir, "prompt", "savings intercepted")
-            else:
-                report = status_report(payload, cfg)
-                log.append(data_dir, "prompt", "status intercepted")
-        except Exception as exc:
-            # The local command must always block: a broken report must
-            # never let the prompt reach the model.
-            report = "warmfold: report failed: %s" % (exc,)
-            log.append(data_dir, "prompt", "report failed: %r" % (exc,))
-        return (
-            {"decision": "block", "reason": report, "suppressOriginalPrompt": True},
-            0,
-        )
+    report_command = text if text in (STATUS_COMMAND, SAVINGS_COMMAND) else None
 
-    # 2. Record activity and reset post-action phases.
+    # 1. Every accepted prompt, including report commands, records activity,
+    #    applies the configured guard, and settles the first return after a
+    #    pending action. The report is computed only after this bookkeeping
+    #    so /warmfold:savings includes the outcome from this turn.
     t_now = now()
     guard_passed = False
     with _session_lock(data_dir, session_id):
@@ -701,6 +778,8 @@ def prompt(payload, cfg):
             "handoff_done",
             "keepalive_pending",
             "compact_sent",
+            "compact_pending",
+            "compact_deferred",
             "cold",
             "done",
         ):
@@ -718,8 +797,8 @@ def prompt(payload, cfg):
         )
         return ({"decision": "block", "reason": reason, "suppressOriginalPrompt": False}, 0)
 
-    # 4. The submit passed, so it is the first user return after any
-    #    pending action: settle its savings outcome.
+    # 4. The submit passed, so it is the first user return after any pending
+    #    action: settle its savings outcome before building a report.
     try:
         _settle_outcomes(data_dir, cfg, session_id, payload, st, t_now,
                          guard_passed)
@@ -728,7 +807,48 @@ def prompt(payload, cfg):
             log.append(data_dir, "prompt", "ledger outcome failed: %r" % (exc,))
         except Exception:
             pass
+
+    if report_command is not None:
+        try:
+            if report_command == SAVINGS_COMMAND:
+                report = _savings_report(cfg, session_id)
+                log.append(data_dir, "prompt", "savings context added")
+            else:
+                report = status_report(payload, cfg)
+                log.append(data_dir, "prompt", "status context added")
+        except Exception as exc:
+            report = "warmfold: report failed: %s" % (exc,)
+            log.append(data_dir, "prompt", "report failed: %r" % (exc,))
+        return (
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": _report_context(report_command, report),
+                }
+            },
+            0,
+        )
     return (None, 0)
+
+
+def _report_context(command, report):
+    """Give Claude a report and an exact rendering instruction.
+
+    UserPromptSubmit hooks cannot write an assistant message themselves.
+    Suppressing the command with ``decision=block`` makes Claude Code show a
+    hook error, so the report travels as additional context and the command
+    markdown asks the normal response path to print it verbatim.
+    """
+    label = "status" if command == STATUS_COMMAND else "savings"
+    return (
+        "warmfold {label} report (computed locally):\n"
+        "<warmfold-report>\n"
+        "{report}\n"
+        "</warmfold-report>\n\n"
+        "The slash command instruction asks you to display this report. "
+        "Output only the text between the report tags, preserving its line "
+        "breaks exactly. Do not call tools, modify files, or add commentary."
+    ).format(label=label, report=report.rstrip("\n"))
 
 
 def _guard_reason(payload, cfg, st, t_now):
@@ -941,12 +1061,16 @@ def status(payload, cfg):
     return (status_report(payload, cfg), 0)
 
 
-def _next_action_text(cfg, st, info, ttl, t_now):
+def _next_action_text(cfg, st, info, ttl, t_now, payload=None):
     phase = st.get("phase") or "idle"
     if phase == "handoff_pending":
         return "waiting for the handoff summary"
     if phase == "compact_sent":
         return "waiting for the compaction to finish"
+    if phase == "compact_pending":
+        return "waiting for an uncertain native compaction result"
+    if phase == "compact_deferred":
+        return "compaction deferred until the native terminal is idle"
     if phase == "keepalive_pending":
         return "waiting for the keep-alive reply"
     if phase == "done":
@@ -970,11 +1094,11 @@ def _next_action_text(cfg, st, info, ttl, t_now):
     )
     if due_at <= t_now:
         return "due now"
-    return "%s about %s" % (_action_noun(cfg), _local_hm(due_at))
+    return "%s about %s" % (_action_noun(cfg, payload), _local_hm(due_at))
 
 
-def _action_noun(cfg):
-    mode = _resolve_mode(cfg)
+def _action_noun(cfg, payload=None):
+    mode = _resolve_mode(cfg, payload)
     return {
         "compact": "compaction",
         "handoff": "handoff",
@@ -1034,7 +1158,7 @@ def status_report(payload, cfg):
     else:
         lines.append("Idle: unknown")
 
-    channel = _detect_channel(cfg, cfg.get("data_dir"))
+    channel = _detect_channel(cfg, cfg.get("data_dir"), payload)
     lines.append("Channel: %s" % ("none" if channel is None else channel.name))
 
     mode = cfg.get("mode") or "auto"
@@ -1045,7 +1169,7 @@ def status_report(payload, cfg):
         lines.append("Mode: %s" % mode)
 
     lines.append(
-        "Next action: %s" % _next_action_text(cfg, st, info, ttl, t_now)
+        "Next action: %s" % _next_action_text(cfg, st, info, ttl, t_now, payload)
     )
 
     if ctx and model:
