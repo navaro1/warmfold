@@ -16,7 +16,7 @@ code. Prose in this repo follows ASD-STE100 Simplified Technical English.
 | Hooks cannot run slash commands. Scheduled tasks (cron, `/loop`) deliver built-in commands as plain text. | Only a keystroke in a terminal, or the user, can run `/compact`. |
 | An `async: true, asyncRewake: true` command hook that exits 2 wakes Claude even while the session is idle. Its stderr reaches Claude as a system reminder. | This is the universal idle trigger. It works in the CLI, Desktop app, VS Code, and SDK hosts such as T3 Code. |
 | `Stop` input has `last_assistant_message`, `background_tasks`, `session_crons`. `Stop` does not fire on user interrupt. `StopFailure` fires on API errors. | The watcher uses the event to evaluate native compaction. |
-| `UserPromptSubmit` can block a prompt (`decision: "block"`, `reason`, `suppressOriginalPrompt`) or add `hookSpecificOutput.additionalContext` for the normal response path. | The return guard still applies to every real turn. `/warmfold:status` and `/warmfold:savings` compute read-only reports locally after normal prompt bookkeeping, then ask Claude to render them verbatim through a normal response. |
+| `UserPromptSubmit` can block a prompt (`decision: "block"`, `reason`, `suppressOriginalPrompt`) or add `hookSpecificOutput.additionalContext` for the normal response path. | warmfold never blocks a prompt. `/warmfold:status` and `/warmfold:savings` compute read-only reports locally after normal prompt bookkeeping, then ask Claude to render them verbatim through a normal response. |
 | `SessionStart` matchers: `startup`, `resume`, `clear`, `compact`. Its `additionalContext` reaches Claude. | SessionStart only resets watcher state. |
 | `Notification/idle_prompt` fires ~60 s after Claude stops, only if the user typed nothing. | Hint that the input box is empty. |
 | Hook processes inherit the environment of the `claude` process (`TMUX_PANE`, `ZELLIJ_SESSION_NAME`, `KITTY_LISTEN_ON`, `WEZTERM_PANE`, `STY`). Hooks run without a controlling tty. | Channel detection uses env vars. Injection uses the multiplexer CLI, never `/dev/tty`. |
@@ -63,16 +63,13 @@ Precedence, first match wins:
 | `mode` | string | `auto` | `auto`, `compact`, `keepalive`, `warn`. Legacy `handoff` maps to `auto`. |
 | `keepalive_hours` | number | 0 | In `keepalive` mode: max hours of keep-alive wakes, then native compaction. |
 | `ttl_5m_policy` | string | `warn` | `warn`, `compact_at_4m`, `off`. Applies when the session TTL is 5 min. |
-| `guard` | boolean | true | Block the first prompt once when the cache is cold and the context is large. |
-| `guard_min_usd` | number | 1.0 | Guard only when the estimated cold cost is at least this. |
-| `guard_ack_seconds` | number | 120 | After a block, the next submit inside this window passes. |
 | `poll_seconds` | number | 15 | Watcher poll interval. |
 | `pane_markers` | string | `❯ ` | Comma-separated substrings. The captured screen must contain one, on a line framed by rule lines, before typing. |
 | `data_dir` | string | `$CLAUDE_PLUGIN_DATA` or `~/.claude/warmfold` | State, ledger, log; legacy handoff data is preserved but unused. |
 | `force_ttl_seconds` | number | 0 | Test only. Overrides the TTL read from the transcript. |
 | `force_channel` | string | `` | Test only. `none` disables keystroke channels. |
 
-`userConfig` in `plugin.json` exposes: `idle_minutes` (min 1, max 55), `min_context_tokens`, `mode` (with `options`), `guard`, `ttl_5m_policy` (with `options`), `keepalive_hours` (min 0, max 12). Every key has a `default`. The `options` field needs Claude Code 2.1.271 or later.
+`userConfig` in `plugin.json` exposes: `idle_minutes` (min 1, max 55), `min_context_tokens`, `mode` (with `options`), `ttl_5m_policy` (with `options`), `keepalive_hours` (min 0, max 12). Every key has a `default`. The `options` field needs Claude Code 2.1.271 or later.
 
 ## 4. State
 
@@ -83,7 +80,6 @@ armed_token      float  epoch of the Stop that owns the current watcher
 phase            str    idle | keepalive_pending | compact_sent | compact_pending | compact_deferred | cold | done
 activity_at      float  last UserPromptSubmit
 idle_confirmed_at float last Notification idle_prompt
-guard_ack_until  float
 last_action_at   float
 wake_count       int    keep-alive wakes since last user activity
 last_compact_at  float  from PostCompact
@@ -120,7 +116,7 @@ All read JSON from stdin. All exit 0 with optional JSON on stdout unless stated.
      - exit 0 if `os.getppid()` changed (claude died), or `state.armed_token != my token` (superseded), or `state.activity_at > my token` (user typed).
      - Re-read transcript. If `last_assistant_at > my token + 2 s`: another turn happened (background task, cron). Exit 0; that turn's Stop re-arms.
      - `idle = now - my token`. `expires_at = last_request_start + ttl - margin`. If `ttl` unknown: assume 3600 and log.
-     - If `now >= expires_at`: set `phase = cold`, exit 0. The guard handles the return.
+     - If `now >= expires_at`: set `phase = cold`, exit 0.
      - If `context_tokens` unknown or `< min_context_tokens`: exit 0.
      - `due = idle >= idle_minutes*60 or (expires_at - now) <= 60`.
      - If `ttl == 300`: apply `ttl_5m_policy` (`warn` and `off` → exit 0; `compact_at_4m` → `due = idle >= 240`).
@@ -130,9 +126,8 @@ All read JSON from stdin. All exit 0 with optional JSON on stdout unless stated.
      - `keepalive`: if `wake_count * 55 min < keepalive_hours*3600`: `phase = keepalive_pending`, print KEEPALIVE_REMINDER to stderr, exit 2. Else attempt native compaction.
      - `warn`: exit 0.
 - `prompt` (UserPromptSubmit, sync, timeout 10):
-  1. If `prompt.strip()` exactly equals `/warmfold:status` or `/warmfold:savings`, run the normal activity/reset, configured guard, and pending-action settlement path. After a passing submit, build the read-only report and output `{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":<report plus verbatim rendering instruction>}}`, exit 0. Do not block or suppress the command. Claude renders the report through a normal response, which uses the usual API request and is recorded in the transcript.
+  1. If `prompt.strip()` exactly equals `/warmfold:status` or `/warmfold:savings`, run the normal activity/reset and pending-action settlement path. Then build the read-only report and output `{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":<report plus verbatim rendering instruction>}}`, exit 0. Do not block or suppress the command. Claude renders the report through a normal response, which uses the usual API request and is recorded in the transcript.
   2. `activity_at = now`. If `phase` in `(keepalive_pending, compact_sent, cold, done)`: `phase = idle`, `wake_count = 0`.
-  3. Guard: read transcript. `cold = now > last_request_start + ttl`. If `guard` and cold and `context_tokens >= min_context_tokens` and `cold_cost_usd >= guard_min_usd` and `now > guard_ack_until`: set `guard_ack_until = now + guard_ack_seconds`, output block JSON with the GUARD_MESSAGE (idle duration, context tokens, model, estimated cost, "resend to continue at full cost"). `suppressOriginalPrompt: false`.
 - `session-start` (SessionStart, matchers `startup|resume|clear|compact`): reset watcher state for the new session id. It never reads or injects legacy files.
 - `session-end` (SessionEnd, must finish in < 1 s): set `phase = done`. Nothing else.
 - `notification` (Notification, matcher `idle_prompt`): `idle_confirmed_at = now`.
@@ -202,7 +197,6 @@ Real `claude` sessions in tmux, model `claude-haiku-4-5`, `--plugin-dir <repo>`,
 | Case | Setup | Assert |
 |---|---|---|
 | `compact-tmux` | claude inside tmux | transcript gets a `compact_boundary` with `trigger: manual` within 3 min after the turn end; state `phase = compact_sent` |
-| `guard-cold` | channel forced unavailable plus `WARMFOLD_FORCE_TTL_SECONDS=30`; wait for `compact_deferred`, then past `last_request_start + 30s`; type a prompt | the watcher records `compact_deferred` without fallback injection; the pane shows the guard message; the prompt was not sent; a second submit passes |
 | `status-local` | type `/warmfold:status` | the pane shows the report through a normal assistant response and the command turn appears in the transcript |
 | `zellij` | claude inside a zellij session (`zellij --session warmfold-test`) | same assertion as compact-tmux |
 
@@ -239,7 +233,7 @@ Outcome record (written once per action, at the first user return after the acti
 Rules, evaluated in `prompt` (UserPromptSubmit):
 - `realized`: the return happened after `cold_at` of the action. `saved_usd = avoid_usd - paid_usd - rebuild`, where `rebuild` is the cold cost of the current (compacted or cleared) context when the return is also cold, else 0.
 - `early`: the return happened before `cold_at`. The action was not needed. `saved_usd = -paid_usd`.
-- `paid_cold` (legacy handoff accounting only): the user passed the guard and continued on the old context. `saved_usd = -paid_usd`.
+- `paid_cold` (legacy, read only): old ledgers may hold it. warmfold no longer writes it. `saved_usd = -paid_usd`.
 Each action gets at most one outcome. Actions without an outcome are `pending`.
 
 Report (`/warmfold:savings`, computed locally by the prompt hook and rendered by Claude; also `python3 warmfold.py savings` for a shell-only report):

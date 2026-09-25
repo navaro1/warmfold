@@ -14,7 +14,6 @@ DEFAULTS = {
     "phase": "idle",
     "activity_at": 0.0,
     "idle_confirmed_at": 0.0,
-    "guard_ack_until": 0.0,
     "last_action_at": 0.0,
     "wake_count": 0,
     "last_compact_at": 0.0,
@@ -43,7 +42,6 @@ _FLOAT_KEYS = frozenset(
         "armed_token",
         "activity_at",
         "idle_confirmed_at",
-        "guard_ack_until",
         "last_action_at",
         "last_compact_at",
     )

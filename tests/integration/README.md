@@ -25,7 +25,7 @@ with status 130 and 143; the EXIT trap then cleans up.
 
     tests/integration/run.sh all
     tests/integration/run.sh compact-tmux
-    ART=/tmp/warmfold-art tests/integration/run.sh guard-cold
+    ART=/tmp/warmfold-art tests/integration/run.sh savings
 
 The script prints one `ok` or `FAIL` line per check, with evidence under each
 failed check. The exit code is non-zero when any check fails. A full run takes
@@ -71,14 +71,6 @@ Extra values per case:
   `savings`, and `zellij`. This forces the 1 h policy on any credential. The
   compaction then fires at 60 s idle on a plan with a 5 min TTL too, and the
   test is deterministic.
-- `WARMFOLD_FORCE_TTL_SECONDS=30` on `guard-cold`. The watcher first reaches
-  `compact_deferred`; the harness then waits past `last_request_start + 30 s`
-  before sending the prompt, so the guard sees a genuinely cold return.
-  `WARMFOLD_GUARD_MIN_USD=0.0001` lowers the cost gate: a context just
-  above 1000 tokens costs less than the default `$1` minimum.
-  `WARMFOLD_GUARD_ACK_SECONDS=60` bounds the ack window that lets the
-  resent prompt pass.
-- `WARMFOLD_FORCE_CHANNEL=none` on `guard-cold` to exercise safe deferral.
 - `WARMFOLD_TTL_5M_POLICY` stays unset. The default `warn` policy does
   not compact; the forced TTL removes the need to set it.
 
@@ -106,7 +98,7 @@ Env overrides for the harness itself:
 - The transcript checks parse JSON lines with python3; they never grep for
   JSON text. Each check reads only bytes appended after the recorded offset,
   so an old boundary or an old answer cannot satisfy a check.
-- The guard and status checks compare the screen after the command against a
+- The status checks compare the screen after the command against a
   capture before it, so scrollback text cannot satisfy them.
 
 ## Artifacts
@@ -137,11 +129,6 @@ Env overrides for the harness itself:
   `last_compact_at` greater than the pre-wait value. After a compaction,
   Claude Code fires `SessionStart(compact)`, `PostCompact`, and a `Stop`, and
   the phase returns to `idle`, so the phase alone can be missed.
-- The guard case asserts that a blocked submit leaves no user record and no
-  assistant usage record in the transcript. This follows the design: a
-  blocked `UserPromptSubmit` produces no API call. If a claude version starts
-  writing the blocked prompt as a user record, this check fails and the
-  assumption needs a new look.
 - The status labels come from the plugin's report builder. If the wording
   changes there, the label list in `case_status_local` changes with it.
 - Status and savings reports are computed locally by the hook, then rendered

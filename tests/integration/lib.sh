@@ -51,7 +51,6 @@ POLL="${POLL:-3}"                     # poll interval in seconds
 PROMPT1='Say the word ready and stop.'
 # PROMPT2 gains a random identifier word per case; see begin_case.
 PROMPT2=""
-PROMPT_GUARD='Count from 1 to 5, then stop.'
 # PROMPT_RETURN is the first user return after a compaction; with
 # WARMFOLD_FORCE_TTL_SECONDS=3600 it lands long before cold_at, so the
 # ledger outcome is early (DESIGN.md section 12).
@@ -63,8 +62,7 @@ SAVINGS_CMD='/warmfold:savings'
 WARMFOLD_KEYS=(
   WARMFOLD_IDLE_MINUTES WARMFOLD_MIN_CONTEXT_TOKENS
   WARMFOLD_SAFETY_MARGIN_MINUTES WARMFOLD_MODE WARMFOLD_KEEPALIVE_HOURS
-  WARMFOLD_TTL_5M_POLICY WARMFOLD_GUARD WARMFOLD_GUARD_MIN_USD
-  WARMFOLD_GUARD_ACK_SECONDS WARMFOLD_POLL_SECONDS
+  WARMFOLD_TTL_5M_POLICY WARMFOLD_POLL_SECONDS
   WARMFOLD_PANE_MARKERS WARMFOLD_DATA_DIR WARMFOLD_FORCE_TTL_SECONDS
   WARMFOLD_FORCE_CHANNEL
 )
@@ -235,32 +233,6 @@ sys.exit(1)
 ' "$1" "$2"
 }
 
-# transcript_has_no_records_after <transcript> <byte-offset>
-# 0 when no user and no assistant record was appended after the offset.
-transcript_has_no_records_after() {
-  python3 -c '
-import json, sys
-path, off = sys.argv[1], int(sys.argv[2])
-try:
-    with open(path, "rb") as f:
-        f.seek(off)
-        data = f.read().decode("utf-8", "replace")
-except OSError:
-    sys.exit(1)
-for line in data.splitlines():
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        d = json.loads(line)
-    except Exception:
-        continue
-    if d.get("type") in ("user", "assistant"):
-        sys.exit(1)
-sys.exit(0)
-' "$1" "$2"
-}
-
 # transcript_has_no_compact_after <transcript> <byte-offset>
 # 0 when no system record with subtype compact_boundary was appended after
 # the offset.
@@ -404,21 +376,6 @@ wait_for_file() { # <path> <timeout>
   [ -s "$path" ]
 }
 
-wait_for_state_phase() { # <wanted-phase> <timeout>
-  local want="$1" timeout="$2"
-  local deadline=$(( $(date +%s) + timeout ))
-  local sf p
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    sf="$(state_file)"
-    if [ -n "$sf" ] && [ -f "$sf" ]; then
-      p="$(json_field "$sf" phase)"
-      [ "$p" = "$want" ] && return 0
-    fi
-    sleep "$POLL"
-  done
-  return 1
-}
-
 # wait_for_compact_state <baseline-last_compact_at> <timeout>
 # 0 when the phase reaches compact_sent or last_compact_at grows past baseline.
 wait_for_compact_state() {
@@ -560,25 +517,6 @@ join_quoted() {
     out="$out $(printf '%q' "$part")"
   done
   printf '%s' "${out# }"
-}
-
-# wait_for_new_screen_text <session> <before-file> <grep-ERE> <timeout>
-# Polls until a line that the pane did not show before matches the pattern.
-# Leaves the new lines in NEW_SCREEN_LINES.
-wait_for_new_screen_text() {
-  local s="$1" before="$2" pat="$3" timeout="$4"
-  local deadline=$(( $(date +%s) + timeout ))
-  local after="$CASE_DIR/screen-new-poll.txt"
-  NEW_SCREEN_LINES=""
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    capture "$s" > "$after" 2>/dev/null || true
-    NEW_SCREEN_LINES="$(screen_new_lines "$before" "$after")"
-    if printf '%s\n' "$NEW_SCREEN_LINES" | grep -qiE "$pat"; then
-      return 0
-    fi
-    sleep "$POLL"
-  done
-  return 1
 }
 
 # screen_has_exact_line <text> <needle>

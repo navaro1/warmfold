@@ -14,7 +14,6 @@ import contextlib
 import os
 import sys
 import time
-from datetime import datetime, timezone
 
 try:
     import fcntl
@@ -33,13 +32,6 @@ STATUS_COMMAND = "/warmfold:status"
 SAVINGS_COMMAND = "/warmfold:savings"
 
 KEEPALIVE_REMINDER = "warmfold keep-alive. Reply with exactly: ok\n"
-
-GUARD_MESSAGE = (
-    "warmfold: the prompt cache is cold.\n"
-    "Idle for {idle_min} minutes. Context is {tokens} tokens on {model}.\n"
-    "The next request pays about {usd} USD to rebuild the cache.\n"
-    "Resend to continue at full cost."
-)
 
 
 def now():
@@ -84,15 +76,6 @@ def _num(cfg, key, default):
 def _local_hm(epoch):
     try:
         return time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch))
-    except (OverflowError, OSError, ValueError):
-        return "unknown"
-
-
-def _utc_iso(epoch):
-    try:
-        return datetime.fromtimestamp(epoch, timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
     except (OverflowError, OSError, ValueError):
         return "unknown"
 
@@ -280,13 +263,8 @@ def _outcome_rules(act, info, cfg, payload, t_now):
     return "realized", avoid - paid - rebuild, estimate
 
 
-def _settle_outcomes(data_dir, cfg, session_id, payload, st, t_now,
-                     guard_passed):
+def _settle_outcomes(data_dir, cfg, session_id, payload, st, t_now):
     """Write one outcome per pending action of this session.
-
-    A blocked submit above is not a user return, so this runs only on a
-    prompt that passes. A guard pass on a legacy action is paid_cold: the user
-    continued on the old context and will pay the rebuild.
 
     The ledger lock is held across the pending check and the appends, so
     two concurrent sessions cannot settle the same action twice.
@@ -303,18 +281,10 @@ def _settle_outcomes(data_dir, cfg, session_id, payload, st, t_now,
             if tpath
             else transcript.TranscriptInfo()
         )
-        newest = pending[-1]
         for act in pending:
-            if guard_passed and act is newest and act.get("action") == "handoff":
-                outcome, saved, estimate = (
-                    "paid_cold",
-                    -_f(act.get("paid_usd")),
-                    None,
-                )
-            else:
-                outcome, saved, estimate = _outcome_rules(
-                    act, info, cfg, payload, t_now
-                )
+            outcome, saved, estimate = _outcome_rules(
+                act, info, cfg, payload, t_now
+            )
             ledger.append_record(
                 data_dir,
                 ledger.outcome_record(
@@ -575,12 +545,10 @@ def prompt(payload, cfg):
     text = text.strip()
     report_command = text if text in (STATUS_COMMAND, SAVINGS_COMMAND) else None
 
-    # 1. Every accepted prompt, including report commands, records activity,
-    #    applies the configured guard, and settles the first return after a
-    #    pending action. The report is computed only after this bookkeeping
+    # 1. Every prompt, including report commands, records activity and
+    #    settles the first return after a pending action. The report is computed only after this bookkeeping
     #    so /warmfold:savings includes the outcome from this turn.
     t_now = now()
-    guard_passed = False
     with _session_lock(data_dir, session_id):
         st = state.load(data_dir, session_id)
         st["activity_at"] = t_now
@@ -594,23 +562,12 @@ def prompt(payload, cfg):
         ):
             st["phase"] = "idle"
             st["wake_count"] = 0
-
-        # 3. Cold-return guard: block once, then let one submit pass.
-        reason, guard_passed = _guard_reason(payload, cfg, st, t_now)
         state.save(data_dir, session_id, st)
-    if reason is not None:
-        log.append(
-            data_dir,
-            "prompt",
-            "guard block; ack until %s" % _utc_iso(st["guard_ack_until"]),
-        )
-        return ({"decision": "block", "reason": reason, "suppressOriginalPrompt": False}, 0)
 
-    # 4. The submit passed, so it is the first user return after any pending
+    # 2. The submit is the first user return after any pending
     #    action: settle its savings outcome before building a report.
     try:
-        _settle_outcomes(data_dir, cfg, session_id, payload, st, t_now,
-                         guard_passed)
+        _settle_outcomes(data_dir, cfg, session_id, payload, st, t_now)
     except Exception as exc:
         try:
             log.append(data_dir, "prompt", "ledger outcome failed: %r" % (exc,))
@@ -658,48 +615,6 @@ def _report_context(command, report):
         "Output only the text between the report tags, preserving its line "
         "breaks exactly. Do not call tools, modify files, or add commentary."
     ).format(label=label, report=report.rstrip("\n"))
-
-
-def _guard_reason(payload, cfg, st, t_now):
-    """Return (block reason, guard_passed).
-
-    guard_passed is True only for the one submit an ack bought: the user
-    saw the warning and continued on the cold context.
-    """
-    if not cfg.get("guard"):
-        return None, False
-    tpath = payload.get("transcript_path") or st.get("transcript_path")
-    if not tpath:
-        return None, False
-    info = transcript.read_transcript(tpath)
-    if info.last_request_start <= 0.0:
-        return None, False
-    ttl = _resolve_ttl(
-        info, cfg, payload.get("cwd") or st.get("cwd")
-    )[0]
-    if t_now <= info.last_request_start + ttl:
-        return None, False  # still warm
-    ctx = info.context_tokens
-    if ctx is None or ctx < _num(cfg, "min_context_tokens", 100000.0):
-        return None, False
-    usd = cost.cold_return_usd(ctx, info.model, ttl)
-    if usd < _num(cfg, "guard_min_usd", 1.0):
-        return None, False
-    if t_now <= (st.get("guard_ack_until") or 0.0):
-        # This submit is the one pass the ack bought; spend it now so a
-        # later cold submit blocks again.
-        st["guard_ack_until"] = 0.0
-        return None, True
-    st["guard_ack_until"] = t_now + _num(cfg, "guard_ack_seconds", 120.0)
-
-    idle_min = int(max(0.0, t_now - info.last_request_start) // 60)
-    model = info.model or "unknown model"
-    return (
-        GUARD_MESSAGE.format(
-            idle_min=idle_min, tokens=ctx, model=model, usd="%.2f" % usd
-        ),
-        False,
-    )
 
 
 # ---------------------------------------------------------------------------

@@ -18,9 +18,6 @@ DEFAULTS = {
     "mode": "auto",
     "keepalive_hours": 0.0,
     "ttl_5m_policy": "warn",
-    "guard": True,
-    "guard_min_usd": 1.0,
-    "guard_ack_seconds": 120.0,
     "poll_seconds": 15.0,
     "pane_markers": "❯ ",
     "data_dir": "",
@@ -41,13 +38,10 @@ DEFAULTS = {
 _NUMBER_KEYS = frozenset(
     k for k, v in DEFAULTS.items() if isinstance(v, float)
 )
-_BOOL_KEYS = frozenset(k for k, v in DEFAULTS.items() if isinstance(v, bool))
 _ENUM_KEYS = {
     "mode": frozenset(("auto", "compact", "handoff", "keepalive", "warn")),
     "ttl_5m_policy": frozenset(("warn", "off", "compact_at_4m")),
 }
-_TRUE_WORDS = frozenset(("1", "true", "yes"))
-_FALSE_WORDS = frozenset(("0", "false", "no"))
 
 
 class _Invalid(object):
@@ -86,17 +80,6 @@ def _coerce(key, value):
         if not math.isfinite(number) or number < 0:
             return _INVALID
         return number
-    if key in _BOOL_KEYS:
-        if isinstance(value, bool):
-            return value
-        if value is None:
-            return _INVALID
-        text = str(value).strip().lower()
-        if text in _TRUE_WORDS:
-            return True
-        if text in _FALSE_WORDS:
-            return False
-        return _INVALID
     if key in _ENUM_KEYS:
         if value is None:
             return _INVALID

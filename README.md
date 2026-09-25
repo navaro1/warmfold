@@ -83,7 +83,6 @@ Live tests on 2026-09-21 with Claude Code 2.1.278 on Linux. Each test used a rea
 | tmux 3.2a | compact in place (keystrokes) | pass, one compaction, no loop |
 | zellij 0.45.1 | compact in place (keystrokes, `--pane-id`) | pass |
 | T3 Code desktop 0.0.43 nightly (Agent SDK) | native `/compact` dispatch | proof reduced the context from 30940 to 6082 tokens; hooks loaded from the user-scope plugin |
-| Cold return guard | block once, then pass | pass |
 | `/warmfold:status` | local report rendered by the normal Claude response path | pass |
 
 ## Configure
@@ -95,7 +94,6 @@ The plugin shows these options in `/config`:
 | `idle_minutes` | 30 | Idle minutes before the watcher acts. |
 | `min_context_tokens` | 100000 | Contexts below this size are ignored. |
 | `mode` | `auto` | `auto`, `compact`, `keepalive`, or `warn`. Legacy `handoff` config maps to `auto`. |
-| `guard` | true | Block the first prompt on a cold return. |
 | `ttl_5m_policy` | `warn` | `warn`, `compact_at_4m`, or `off`. Applies to a 5-minute cache. |
 | `keepalive_hours` | 0 | Maximum keepalive hours. When the budget ends, warmfold attempts native compaction. |
 
@@ -104,8 +102,6 @@ Advanced keys. Set them in `~/.claude/plugins/data/warmfold-warmfold-local/confi
 | Key | Default | Meaning |
 |---|---|---|
 | `safety_margin_minutes` | 5 | Act at least this long before cache expiry. |
-| `guard_min_usd` | 1.0 | Guard only above this rebuild cost. |
-| `guard_ack_seconds` | 120 | A second submit inside this window passes. |
 | `poll_seconds` | 15 | Watcher poll interval. |
 | `pane_markers` | `❯ ` | Prompt markers the watcher looks for. |
 | `data_dir` | `$CLAUDE_PLUGIN_DATA`, else `~/.claude/warmfold` | State, ledger, and log. Legacy handoff data is preserved but unused. |
@@ -137,7 +133,7 @@ then renders it through a normal response, so the command uses the session's
 usual API request and appears in the transcript.
 
 - realized: the return came after the cache expired. The action avoided the cold rebuild.
-- wasted: the return came early, or the guard passed on the old context. The action cost more than it saved.
+- wasted: the return came early. The action cost more than it saved.
 - pending: the plugin acted, and no return happened yet.
 
 Estimates use list prices. The ledger is `<data_dir>/ledger.jsonl`.
@@ -189,7 +185,6 @@ WARMFOLD_IDLE_MINUTES=1 \
 WARMFOLD_MIN_CONTEXT_TOKENS=1000 \
 WARMFOLD_POLL_SECONDS=1 \
 WARMFOLD_FORCE_TTL_SECONDS=3600 \
-WARMFOLD_GUARD=0 \
 claude --plugin-dir "$repo"
 ```
 

@@ -473,31 +473,6 @@ def test_watch_project_setting_drives_ttl(monkeypatch, env):
     assert load_state(env)["phase"] == "compact_deferred"
 
 
-def test_prompt_guard_uses_project_dir_ttl(monkeypatch, env):
-    # Without a setting the unknown 5m default makes the submit cold and
-    # blocked. With promptCacheTtl=1h in the payload cwd the same submit
-    # is warm and passes.
-    clock = install_clock(monkeypatch)
-    write_transcript(
-        env.tpath,
-        [
-            user_line(T - 2000),
-            asst_line(T - 1990, create=1000, read=399000, w1h=0, w5m=0),
-        ],
-    )
-    env.cfg.update({"guard_min_usd": 0.5})  # the 5m cold cost is $0.80
-    out, code = events.prompt(dict(env.payload), env.cfg)
-    assert code == 0
-    assert out is not None and out["decision"] == "block"
-
-    write_json(
-        os.path.join(str(env.tmp_path), ".claude", "settings.local.json"),
-        {"promptCacheTtl": "1h"},
-    )
-    out, code = events.prompt(dict(env.payload), env.cfg)
-    assert (out, code) == (None, 0)
-
-
 def test_status_report_uses_saved_state_cwd_for_ttl(monkeypatch, env):
     # Status has no event payload here; it falls back to the cwd in the
     # saved state and reads the project setting from that directory.
@@ -919,83 +894,6 @@ def test_prompt_records_activity_and_resets_phase(monkeypatch, env):
     assert st["wake_count"] == 0
 
 
-def test_prompt_guard_blocks_first_cold_submit(monkeypatch, env):
-    clock = install_clock(monkeypatch)
-    env.cfg["force_ttl_seconds"] = 3600
-    env.cfg["guard_min_usd"] = 1.0
-    # user at T-4000: the 1h cache is cold at T
-    write_transcript(env.tpath, [user_line(T - 4000), asst_line(T - 3990)])
-    payload = dict(env.payload, prompt="keep going")
-    out, code = events.prompt(payload, env.cfg)
-    assert code == 0
-    assert out["decision"] == "block"
-    assert out["suppressOriginalPrompt"] is False
-    assert "the prompt cache is cold" in out["reason"]
-    assert "Resend to continue at full cost" in out["reason"]
-    assert "1.60 USD" in out["reason"]
-    st = load_state(env)
-    assert st["guard_ack_until"] == clock.t + env.cfg["guard_ack_seconds"]
-
-    # the ack lets exactly the next submit pass and spends itself
-    out2, _ = events.prompt(payload, env.cfg)
-    assert out2 is None
-    assert load_state(env)["guard_ack_until"] == 0.0
-
-    # the third cold submit blocks again, even inside the old window
-    out3, _ = events.prompt(payload, env.cfg)
-    assert out3["decision"] == "block"
-
-
-def test_prompt_guard_passes_when_warm(monkeypatch, env):
-    install_clock(monkeypatch)
-    env.cfg["force_ttl_seconds"] = 3600
-    out, code = events.prompt(dict(env.payload, prompt="hello"), env.cfg)
-    assert (out, code) == (None, 0)
-
-
-def test_prompt_guard_passes_below_cost_threshold(monkeypatch, env):
-    install_clock(monkeypatch)
-    env.cfg["force_ttl_seconds"] = 300
-    # 50k tokens on sonnet-5, 5m write price 2 $/MTok -> $0.10 < $1.0
-    write_transcript(
-        env.tpath,
-        [
-            user_line(T - 400),
-            asst_line(T - 390, create=50000, read=0, w1h=0, w5m=50000),
-        ],
-    )
-    out, _ = events.prompt(dict(env.payload, prompt="hello"), env.cfg)
-    assert out is None
-
-
-def test_prompt_guard_passes_below_min_context(monkeypatch, env):
-    install_clock(monkeypatch)
-    env.cfg["force_ttl_seconds"] = 3600
-    env.cfg["min_context_tokens"] = 100000
-    # 50k tokens on fable: $1.00 clears the cost gate, but the context
-    # stays below the 100k threshold.
-    write_transcript(
-        env.tpath,
-        [
-            user_line(T - 4000),
-            asst_line(
-                T - 3990, model="claude-fable-5", create=50000, read=0, w1h=50000
-            ),
-        ],
-    )
-    out, _ = events.prompt(dict(env.payload, prompt="hello"), env.cfg)
-    assert out is None
-
-
-def test_prompt_guard_disabled(monkeypatch, env):
-    install_clock(monkeypatch)
-    env.cfg["force_ttl_seconds"] = 3600
-    env.cfg["guard"] = False
-    write_transcript(env.tpath, [user_line(T - 4000), asst_line(T - 3990)])
-    out, _ = events.prompt(dict(env.payload, prompt="hello"), env.cfg)
-    assert out is None
-
-
 # ---------------------------------------------------------------------------
 # session-start
 
@@ -1025,7 +923,6 @@ def test_session_start_clear_and_startup_build_fresh_state(monkeypatch, env):
         phase="cold",
         armed_token=999.0,
         activity_at=T - 50.0,
-        guard_ack_until=T - 40.0,
         last_action_at=T - 30.0,
         last_compact_at=T - 20.0,
         idle_confirmed_at=T - 10.0,
@@ -1040,7 +937,6 @@ def test_session_start_clear_and_startup_build_fresh_state(monkeypatch, env):
         assert st["armed_token"] == 0.0
         assert st["wake_count"] == 0
         assert st["activity_at"] == 0.0
-        assert st["guard_ack_until"] == 0.0
         assert st["last_action_at"] == 0.0
         assert st["last_compact_at"] == 0.0
         assert st["idle_confirmed_at"] == 0.0
@@ -1201,37 +1097,12 @@ def test_watch_keepalive_writes_ledger_action(monkeypatch, env):
     assert records[0]["avoid_usd"] == pytest.approx(1.6)
 
 
-def test_prompt_settles_paid_cold_on_guard_pass(monkeypatch, env):
-    clock = install_clock(monkeypatch)
+def test_prompt_never_blocks_cold_submit(monkeypatch, env):
+    install_clock(monkeypatch)
     env.cfg["force_ttl_seconds"] = 3600
-    env.cfg["guard_min_usd"] = 0.5  # the 1h cold return is $1.60
     write_transcript(env.tpath, [user_line(T - 4000), asst_line(T - 3990)])
-    act = ledger.append_action(
-        env.data_dir,
-        ts=T - 4000.0,
-        action="handoff",
-        session_id="sess-test",
-        cwd=str(env.tmp_path),
-        model="claude-sonnet-5",
-        context_tokens=400000,
-        ttl_seconds=3600,
-        cold_at=T - 4000.0 + 3600.0,
-        paid_usd=0.11,
-        avoid_usd=1.6,
-    )
-    payload = dict(env.payload, prompt="go on")
-    out, _ = events.prompt(payload, env.cfg)
-    assert out is not None and out["decision"] == "block"
-    # a blocked submit is not a user return: it settles nothing
-    assert ledger.load(env.data_dir) == [act]
-    # the ack lets exactly one submit pass; that pass is paid_cold
-    out2, _ = events.prompt(payload, env.cfg)
-    assert out2 is None
-    outcomes = [r for r in ledger.load(env.data_dir) if r["type"] == "outcome"]
-    assert len(outcomes) == 1
-    assert outcomes[0]["outcome"] == "paid_cold"
-    assert outcomes[0]["ref"] == act["id"]
-    assert outcomes[0]["saved_usd"] == pytest.approx(-0.11)
+    out, code = events.prompt(dict(env.payload, prompt="keep going"), env.cfg)
+    assert (out, code) == (None, 0)
 
 
 def test_prompt_settles_realized_with_rebuild(monkeypatch, env):
@@ -1251,7 +1122,7 @@ def test_prompt_settles_realized_with_rebuild(monkeypatch, env):
         avoid_usd=1.6,
     )
     # the current return is itself cold on a small context, so the rebuild
-    # cost comes off the saving; 1000 tokens stays below the guard floor
+    # cost comes off the saving
     write_transcript(
         env.tpath,
         [
@@ -1301,25 +1172,6 @@ def test_prompt_savings_settles_pending_action_before_rendering_report(
     assert "This session: handoff at" in context
     assert "realized, saved" in context
     assert outcomes(env)[0]["outcome"] == "realized"
-
-
-def test_prompt_report_respects_guard_setting(monkeypatch, env):
-    install_clock(monkeypatch)
-    env.cfg.update({"force_ttl_seconds": 3600, "guard_min_usd": 1.0})
-    write_transcript(env.tpath, [user_line(T - 4000), asst_line(T - 3990)])
-
-    out, _ = events.prompt(
-        dict(env.payload, prompt="/warmfold:status"), env.cfg
-    )
-    assert out["decision"] == "block"
-    assert "hookSpecificOutput" not in out
-
-    env.cfg["guard"] = False
-    out, _ = events.prompt(
-        dict(env.payload, prompt="/warmfold:status"), env.cfg
-    )
-    assert "decision" not in out
-    assert "warmfold status" in out["hookSpecificOutput"]["additionalContext"]
 
 
 def test_prompt_savings_interception_shows_the_report(monkeypatch, env):
@@ -1392,8 +1244,7 @@ def test_prompt_realized_after_cold_at_with_cold_current_context(
     install_clock(monkeypatch)
     env.cfg["force_ttl_seconds"] = 3600
     append_handoff_action(env, cold_at=T - 400.0)
-    # 90k tokens stays below the guard floor but still has a real
-    # rebuild cost: 90k at the 1h write rate is $0.36.
+    # 90k tokens has a real rebuild cost: 90k at the 1h write rate is $0.36.
     write_transcript(
         env.tpath,
         [
@@ -1416,7 +1267,7 @@ def test_prompt_realized_marks_estimate_without_transcript(monkeypatch, env):
     payload = dict(env.payload)
     del payload["transcript_path"]
     out, _ = events.prompt(payload, env.cfg)
-    assert out is None  # the guard has nothing to read, so it passes
+    assert out is None
     assert len(outcomes(env)) == 1
     assert outcomes(env)[0]["outcome"] == "realized"
     assert outcomes(env)[0]["saved_usd"] == pytest.approx(1.49)

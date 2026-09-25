@@ -5,7 +5,7 @@
 #   run.sh <case>          run one case
 #   run.sh all             run every case in sequence
 #
-# Cases: compact-tmux guard-cold status-local savings zellij
+# Cases: compact-tmux status-local savings zellij
 #
 # Each case starts a real claude in a tmux pane (or a zellij pane for the
 # zellij case), sends real prompts, and asserts the watcher behavior in the
@@ -22,7 +22,7 @@ source "$HERE/lib.sh"
 
 usage() {
   log "usage: run.sh <case>"
-  log "cases: compact-tmux guard-cold status-local savings zellij all"
+  log "cases: compact-tmux status-local savings zellij all"
 }
 
 # prime_session <session>: accept the trust dialog, then run two turns so the
@@ -122,78 +122,6 @@ case_compact_tmux() {
   fi
   prime_or_fail "$CURRENT_SESSION" "claude accepted trust and finished two turns" || return 0
   assert_compact tmux
-  end_case
-}
-
-case_guard_cold() {
-  begin_case guard-cold
-  # FORCE_TTL_SECONDS=30 makes the watcher defer before cache expiry; the
-  # watcher exits after recording compact_deferred.
-  # The guard blocks one submit, then lets the resent prompt through the
-  # ack window (DESIGN.md section 6, return guard).
-  build_pane_args none "WARMFOLD_GUARD=1" "WARMFOLD_GUARD_MIN_USD=0.0001" \
-    "WARMFOLD_GUARD_ACK_SECONDS=60" "WARMFOLD_FORCE_TTL_SECONDS=30"
-  if ! start_claude "ccit-${RUN_ID}-guard" "$CASE_DIR/cwd"; then
-    check "claude session started" 1 "tmux new-session failed"
-    end_case
-    return 0
-  fi
-  prime_or_fail "$CURRENT_SESSION" "claude accepted trust and finished two turns" || return 0
-  # With FORCE_TTL_SECONDS=30 the action deadline is start + 30 - min(margin,
-  # 6 s). The watcher defers and exits. Wait for that state, then wait 60 s
-  # from the latest turn so last_request_start + TTL is safely in the past.
-  if wait_for_state_phase compact_deferred 120; then
-    check "watcher deferred without fallback injection" 0
-    sleep 60
-  else
-    check "watcher deferred without fallback injection" 1 \
-      "state: $(clip "$(cat "$(state_file)" 2>/dev/null)")"
-    end_case
-    return 0
-  fi
-  local t
-  t="$(latest_transcript "$CURRENT_CWD")"
-  save_screen "$CURRENT_SESSION" "pre-guard" >/dev/null
-  send_prompt "$CURRENT_SESSION" "$PROMPT_GUARD"
-  if wait_for_new_screen_text "$CURRENT_SESSION" "$CASE_DIR/screen-pre-guard.txt" 'full cost' 60; then
-    check "guard message appeared in new screen output" 0
-  else
-    save_screen "$CURRENT_SESSION" "guard-wait" >/dev/null
-    check "guard message appeared in new screen output" 1 "no new line matched 'full cost'"
-    end_case
-    return 0
-  fi
-  if printf '%s\n' "$NEW_SCREEN_LINES" | grep -qi 'warmfold'; then
-    check "guard message names warmfold" 0
-  else
-    check "guard message names warmfold" 1
-  fi
-  # The blocked submit must leave no user record and no assistant usage
-  # record after the pre-submit offset.
-  sleep 2
-  if [ -n "$t" ] && transcript_has_no_records_after "$t" "$PROMPT_OFFSET"; then
-    check "blocked submit added no user or assistant record" 0
-  else
-    check "blocked submit added no user or assistant record" 1 \
-      "transcript: $t offset: $PROMPT_OFFSET"
-  fi
-  # The ack window lets the second submit through; both records now appear.
-  send_prompt "$CURRENT_SESSION" "$PROMPT_GUARD"
-  if wait_for_turn_end "$CURRENT_SESSION" "$TURN_TIMEOUT"; then
-    check "second submit ran a full turn" 0
-  else
-    save_screen "$CURRENT_SESSION" "guard-resubmit" >/dev/null
-    check "second submit ran a full turn" 1 "the ack window may have closed"
-    end_case
-    return 0
-  fi
-  t="$(latest_transcript "$CURRENT_CWD")"
-  if [ -n "$t" ] && transcript_turn_after "$t" "$PROMPT_OFFSET"; then
-    check "second submit added a user and an assistant usage record" 0
-  else
-    check "second submit added a user and an assistant usage record" 1 \
-      "transcript: $t offset: $PROMPT_OFFSET"
-  fi
   end_case
 }
 
@@ -348,13 +276,11 @@ main() {
   trap 'exit 143' TERM
   case "$1" in
     compact-tmux) case_compact_tmux ;;
-    guard-cold) case_guard_cold ;;
     status-local) case_status_local ;;
     savings) case_savings ;;
     zellij) case_zellij ;;
     all)
       case_compact_tmux
-      case_guard_cold
       case_status_local
       case_savings
       case_zellij

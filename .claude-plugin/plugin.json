@@ -30,12 +30,6 @@
       "default": "auto",
       "options": ["auto", "compact", "keepalive", "warn"]
     },
-    "guard": {
-      "type": "boolean",
-      "title": "Cold return guard",
-      "description": "Block the first prompt once when the cache is cold and the context is large.",
-      "default": true
-    },
     "ttl_5m_policy": {
       "type": "string",
       "title": "5 minute TTL policy",

@@ -125,7 +125,6 @@ def test_wrong_types_fall_back_to_defaults(tmp_path):
                 "channel": 5,
                 "context_tokens": "big",
                 "model": 7,
-                "guard_ack_until": {"t": 1},
             },
             handle,
         )
@@ -137,7 +136,6 @@ def test_wrong_types_fall_back_to_defaults(tmp_path):
     assert st["channel"] == ""
     assert st["context_tokens"] is None
     assert st["model"] is None
-    assert st["guard_ack_until"] == 0.0
 
 
 def test_numeric_coercions(tmp_path):

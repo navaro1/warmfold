@@ -29,9 +29,6 @@ def test_defaults_when_no_overrides():
     assert cfg["mode"] == "auto"
     assert cfg["keepalive_hours"] == 0.0
     assert cfg["ttl_5m_policy"] == "warn"
-    assert cfg["guard"] is True
-    assert cfg["guard_min_usd"] == 1.0
-    assert cfg["guard_ack_seconds"] == 120.0
     assert cfg["poll_seconds"] == 15.0
     assert cfg["force_ttl_seconds"] == 0.0
     assert cfg["force_channel"] == ""
@@ -109,43 +106,19 @@ def test_env_beats_config_json(monkeypatch, tmp_path):
     assert cfg["poll_seconds"] == 5.0
 
 
-def test_boolean_coercion(monkeypatch):
-    for raw, expected in (
-        ("false", False),
-        ("0", False),
-        ("no", False),
-        ("true", True),
-        ("1", True),
-        ("YES", True),
-    ):
-        monkeypatch.setenv("WARMFOLD_GUARD", raw)
-        assert config.load()["guard"] is expected
-
-
 def test_bad_values_keep_defaults(monkeypatch):
     monkeypatch.setenv("WARMFOLD_IDLE_MINUTES", "soon")
-    monkeypatch.setenv("WARMFOLD_GUARD", "maybe-not")
-    cfg = config.load()
-    assert cfg["idle_minutes"] == 30.0
-    # only true/false/1/0/yes/no are booleans; anything else keeps the
-    # lower-priority value
-    assert cfg["guard"] is True
+    assert config.load()["idle_minutes"] == 30.0
 
 
 def test_bad_numbers_keep_defaults(monkeypatch):
     for raw in ("nan", "inf", "-inf", "1e999", "-5"):
         monkeypatch.setenv("WARMFOLD_IDLE_MINUTES", raw)
         assert config.load()["idle_minutes"] == 30.0, raw
-    monkeypatch.setenv("WARMFOLD_GUARD_MIN_USD", "-0.5")
-    assert config.load()["guard_min_usd"] == 1.0
+    monkeypatch.setenv("WARMFOLD_POLL_SECONDS", "-0.5")
+    assert config.load()["poll_seconds"] == 15.0
     monkeypatch.setenv("WARMFOLD_MIN_CONTEXT_TOKENS", "inf")
     assert config.load()["min_context_tokens"] == 100000.0
-
-
-def test_boolean_accepts_only_strict_words(monkeypatch):
-    for raw in ("on", "off", "enabled", "2", "maybe"):
-        monkeypatch.setenv("WARMFOLD_GUARD", raw)
-        assert config.load()["guard"] is True, raw
 
 
 def test_bad_enum_values_keep_defaults(monkeypatch):
